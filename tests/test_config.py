@@ -21,7 +21,7 @@ def test_get_llm_builds_groq(monkeypatch):
     monkeypatch.setattr(
         config,
         "get_settings",
-        lambda: config.Settings(llm_low="groq:llama-3.1-8b-instant", groq_api_key="test", **URLS),
+        lambda: config.Settings(llm_low="groq:openai/gpt-oss-20b", groq_api_key="test", **URLS),
     )
     assert type(config.get_llm("low")).__name__ == "ChatGroq"
 

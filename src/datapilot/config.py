@@ -15,8 +15,8 @@ class Settings(BaseSettings):
     database_url: str
     etl_database_url: str
 
-    llm_low: str = "groq:llama-3.1-8b-instant"
-    llm_high: str = "google:gemini-flash-latest"
+    llm_low: str = "groq:openai/gpt-oss-20b"
+    llm_high: str = "groq:openai/gpt-oss-120b"
     groq_api_key: str = ""
     google_api_key: str = ""
 
@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     max_rows: int = 1000
     statement_timeout_ms: int = 10_000
     max_llm_calls_per_request: int = 12
+    max_context_chars: int = 12_000
+    judge_enabled: bool = True
     etl_allowed_hosts: str = ""
     hints_path: str = ""
 

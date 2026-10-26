@@ -2,7 +2,7 @@
 
 An agentic AI system that takes natural-language requests from business users and automates routine data work: answering questions with SQL and running small ETL jobs. It works against **any PostgreSQL database**. An Ola-style ride-booking dataset is the bundled demo.
 
-Status: in progress. Phase 1 (foundation) is done; Phase 2 (SQL Analyst) is built and tested with a scripted LLM, with live-model verification pending API keys. See Appendix B.
+Status: in progress. Phases 1 (foundation) and 2 (SQL Analyst) are done and verified against live models. Phase 3 (eval harness) is next. See Appendix B.
 
 ---
 
@@ -101,7 +101,7 @@ flowchart TD
 |---|---|---|
 | `curate_question` | low | Normalise the request: resolve pronouns and follow-ups using chat history, strip noise, reject non-questions. |
 | `add_context` | none | Read the schema as the read-only role sees it (`information_schema` for columns, `pg_catalog` for keys): tables, columns, types, PK/FK, and the distinct values of low-cardinality text columns. If the rendered schema exceeds `MAX_CONTEXT_CHARS`, keep the tables that best match the question (keyword overlap) plus their FK neighbours. Merge optional domain hints. |
-| `generate_sql` | high | Produce one SQL query as structured output (`SqlDraft`: `sql`, `assumptions`). On retry, receives the previous SQL and the database error. |
+| `generate_sql` | high | Produce one SQL query as structured output (`SqlDraft`: `sql`, `assumptions`). On retry, receives the previous SQL and the database error. If the schema lacks the data the question needs, it returns `cannot_answer_reason` instead of SQL, which ends the run as a refusal without retries. |
 | `safety_check` | none + low | Layer 1: deterministic; a failure ends the run with a refusal. Layer 2: LLM judge for intent; an objection is a wrong query, not a malicious one, so it goes back to `generate_sql` with the reason (same retry cap). The judge can be turned off with `JUDGE_ENABLED=false`. |
 | `run_query` | none | Execute with the read-only role, `statement_timeout`, and a row limit. A Postgres permission error ends the run as a refusal; other database errors go back to `generate_sql`. |
 | `represent` | low | Turn rows into a 1-3 sentence answer. The CLI renders the result table and, on request, the SQL. If this call fails, a plain "the query returned N rows" answer is used so a successful query is never lost. |
@@ -119,17 +119,17 @@ flowchart TD
 ```python
 class SqlState(BaseModel):
     user_question: str
-    history: list[dict[str, str]] = []     # prior turns, for follow-up questions
+    history: list[dict[str, str]] = []  # prior turns, for follow-up questions
     curated_question: str | None = None
     schema_context: str | None = None
     sql: str | None = None
     assumptions: list[str] = []
-    safety: SafetyVerdict | None = None    # ok: bool, reason: str
+    safety: SafetyVerdict | None = None  # ok: bool, reason: str
     columns: list[str] = []
     rows: list[dict] | None = None
     truncated: bool = False
-    feedback: str | None = None            # judge objection or DB error fed back to generate_sql
-    attempts: int = 0                      # SQL generations; capped at 1 + MAX_SQL_RETRIES
+    feedback: str | None = None  # judge objection or DB error fed back to generate_sql
+    attempts: int = 0  # SQL generations; capped at 1 + MAX_SQL_RETRIES
     llm_calls: int = 0
     tokens_in: int = 0
     tokens_out: int = 0
@@ -238,20 +238,25 @@ The project is **provider-agnostic**. Each tier is configured as `provider:model
 
 | Tier | Default | Used for |
 |---|---|---|
-| low | Groq `llama-3.1-8b-instant` | Curate, represent, route, simple judging. Fast and cheap. |
-| high | Gemini Flash (or Groq `llama-3.3-70b-versatile`) | SQL generation, retry repair. |
+| low | Groq `openai/gpt-oss-20b` | Curate, represent, route, judge. Fast and cheap. |
+| high | Groq `openai/gpt-oss-120b` | SQL generation and retry repair. |
 
-Model names change often; verify them against each provider's current docs when implementing.
+Model names change often; verify them against the provider's model list (`GET /openai/v1/models` for Groq) when implementing. Names used in earlier drafts (`llama-3.1-8b-instant`, `gemini-2.5-flash`) were rejected by the provider for this account.
 
-Constraints of free tiers that the design must handle:
-- **Rate limits:** retries with exponential backoff on 429s, and a global cap on LLM calls per request.
-- **Structured output:** nodes use Pydantic structured output with a JSON-parse fallback and one repair attempt, since smaller models are less reliable at it.
+**Why not Gemini for the high tier.** The Gemini free tier allows 20 requests per day per model. One SQL question uses at least one high-tier call, so that caps usage at about 20 questions a day and the 20-question eval would use the whole quota. Gemini remains supported (`LLM_HIGH=google:<model>`) as a fallback. Groq limits are per account and per model, so using different models for the two tiers also spreads the load.
+
+Constraints of free tiers that the design handles:
+- **Rate limits:** exponential backoff on transient 429s. Daily-quota errors cannot recover within a request, so they fail fast with a clear message and the reset time.
+- **Call budget:** at most `MAX_LLM_CALLS_PER_REQUEST` model calls per request.
+- **Structured output:** nodes use Pydantic structured output. If the model returns unparseable output, or the provider rejects a missing tool call (Groq `tool_use_failed`), the layer retries once asking for plain JSON.
 - **Smaller context windows:** schema context is capped and table selection is applied earlier.
 - **Weaker SQL generation:** the retry loop, sample values in context and the static safety layer matter more than they would on a frontier model.
 
+**Findings from live runs (Groq low, Gemini high, then Groq high).** All legitimate demo questions returned correct results (checked against the database), and requests to change data, for unavailable data (customer emails), or off-topic were refused. Problems found only by live models and fixed: the judge rejected correct literal dates because it did not know today's date; Groq structured-output failures killed requests; the model tried to fabricate a missing column instead of saying the data was absent; and the summary step wrote "$" because it did not see that fares are in INR.
+
 ```env
-LLM_LOW=groq:llama-3.1-8b-instant
-LLM_HIGH=google:gemini-flash-latest
+LLM_LOW=groq:openai/gpt-oss-20b
+LLM_HIGH=groq:openai/gpt-oss-120b
 GROQ_API_KEY=...
 GOOGLE_API_KEY=...
 ```
@@ -264,7 +269,7 @@ GOOGLE_API_KEY=...
 |---|---|---|
 | Agent orchestration | **LangGraph** | `StateGraph` for the SQL Analyst and the parent graph. |
 | LLM abstraction | **LangChain** (`langchain-core`; `langchain` is added in Phase 4 for `create_agent`, the ReAct agent factory that replaces the deprecated `langgraph.prebuilt.create_react_agent`) | Chat model interface, structured output, tool definitions, the ETL ReAct agent. |
-| LLM providers | `langchain-groq`, `langchain-google-genai` | Groq and Gemini free tiers; swappable via config. |
+| LLM providers | `langchain-groq`, `langchain-google-genai` | Groq (default for both tiers) and Gemini (fallback); swappable via config. |
 | Data models | **Pydantic v2** | Graph state, `Route`, `SqlDraft`, `SafetyVerdict`, settings (`pydantic-settings`). |
 | Database | **PostgreSQL 16** (Docker) | Demo and target database. |
 | DB driver | `psycopg` 3 | Connections for the read-only and ETL roles. |
@@ -354,12 +359,12 @@ Agentic systems fail in ways that are only visible in a trace, so every request 
 
 - request id, user input, route decision;
 - per node: input summary, output, latency, model used, token counts;
-- generated SQL, safety verdicts with reasons, retry count and the DB errors that caused them;
+- generated SQL, safety verdicts with reasons, and an `attempt_log` with one entry per SQL attempt (the SQL and why it failed: DB error, judge objection, or refusal);
 - final answer and status (`ok`, `refused`, `failed`).
 
-**Langfuse (primary).** A self-hosted Langfuse instance runs in Docker Compose next to Postgres. The Langfuse LangChain callback handler is attached to every graph invocation, so each node's prompt, response, latency, token count and cost appear as one trace with nested spans. The request id is passed as trace metadata; richer tags and scores (route, safety verdict, attempt number) and Langfuse datasets for eval runs are planned. **Status:** the handler is wired in but untested, and the installed Python SDK (v5) may not be compatible with the self-hosted v2 server in `docker-compose.yml`; this must be resolved (pin the SDK or move to Langfuse v3) before relying on it.
+**Langfuse (primary).** A self-hosted Langfuse instance runs in Docker Compose next to Postgres. The Langfuse LangChain callback handler is attached to every graph invocation, so each node's prompt, response, latency, token count and cost appear as one trace with nested spans. The request id is passed as trace metadata; richer tags and scores (route, safety verdict, attempt number) and Langfuse datasets for eval runs are planned. **Status: not working yet.** Checked against the running server: the installed Python SDK (v5) exports traces to `/api/public/otel/v1/traces`, which the self-hosted v2.95 server in `docker-compose.yml` answers with 404 (it only has the older `/api/public/ingestion` endpoint). The handler is wired in but guarded, so a failure only logs a warning. Fix by either pinning the SDK to v2 (`langfuse<3`, whose compatibility with the installed `langchain-core` is unverified) or moving the server to Langfuse v3 (adds ClickHouse, Redis and S3-compatible storage).
 
-**JSONL log (offline fallback).** Each request also appends one line to `logs/traces.jsonl` with request id, route, curated question, final SQL, safety verdicts, attempts, status and token totals. The planned eval runner will read this file, so evals work without Langfuse running. If Langfuse is not configured or its setup fails, the agent logs a warning and continues; observability must never break a request.
+**JSONL log (offline fallback).** Each request also appends one line to `logs/traces.jsonl` with request id, curated question, final SQL, safety verdict, the per-attempt log, status, token totals and latency (the route is added when the parent router exists). The planned eval runner will read this file, so evals work without Langfuse running. If Langfuse is not configured or its setup fails, the agent logs a warning and continues; observability must never break a request.
 
 **Privacy.** Traces contain prompts and query results, so they may include business data. Langfuse is self-hosted, so nothing leaves the machine except the LLM calls themselves. Values of hidden columns never appear in traces because they never reach the prompt or the result set. A refused query or the user's own question may still name a hidden column.
 
@@ -386,7 +391,8 @@ The callback interface is generic, so LangSmith could replace Langfuse by swappi
 | Cost on large schemas | Table selection; cap context size. |
 | Which API for the ETL demo? | Default: Open-Meteo (free, no key), joined to rides by city and date. |
 | CLI vs web UI | CLI first; Streamlit later if wanted. |
-| Langfuse SDK v5 vs self-hosted server v2 | Untested; pin the SDK or move to Langfuse v3 when tracing is first exercised. |
+| Langfuse SDK v5 vs self-hosted server v2 | Confirmed incompatible (OTLP endpoint returns 404). Pin the SDK to v2 or upgrade the server to v3; tracing is off until then. |
+| Provider free-tier quotas | Gemini: 20 requests/day/model, so Groq is the default for both tiers; fail fast on daily-quota errors. |
 | ETL role cannot read the city list it needs | Add an explicit reference-table grant in Phase 4. |
 
 ---
@@ -420,7 +426,7 @@ datapilot/
 ## Appendix B. Build phases
 
 1. **Foundation (done):** scaffold, Postgres in Docker, roles, synthetic data, introspection.
-2. **SQL Analyst (built; live-model verification pending API keys):** safety layers, nodes, graph, retries, `ask` command, tracing, tests with a scripted LLM.
+2. **SQL Analyst (done):** safety layers, nodes, graph, retries, `ask` command, JSONL tracing, tests with a scripted LLM, and live verification on Groq. Langfuse tracing is carried forward (see Observability).
 3. **Eval harness:** the 20-question eval set and runner, so prompt and model choices are measured.
 4. **ETL Analyst:** tools, ReAct agent, staging-only writes.
 5. **Parent router:** routing, conversation loop.
