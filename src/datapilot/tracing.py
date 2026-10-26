@@ -57,6 +57,31 @@ def log_request(
         log.warning("could not write trace log: %s", e)
 
 
+def log_turn(
+    turn: Any, request_id: str, session_id: str, latency_s: float, path: Path = DEFAULT_LOG_PATH
+) -> None:
+    """One JSONL line per chat turn, with the routing decision and the child's outcome."""
+    record = {
+        "request_id": request_id,
+        "session_id": session_id,
+        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+        "kind": "chat_turn",
+        "message": turn.message,
+        "route": turn.route,
+        "status": turn.status,
+        "sql": turn.sql.sql if turn.sql else None,
+        "etl_loads": [ld.table for ld in turn.etl.loads] if turn.etl else None,
+        "llm_calls": turn.llm_calls,
+        "latency_ms": round(latency_s * 1000),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as e:
+        log.warning("could not write trace log: %s", e)
+
+
 def langfuse_configured() -> bool:
     s = get_settings()
     return bool(s.langfuse_host and s.langfuse_public_key and s.langfuse_secret_key)

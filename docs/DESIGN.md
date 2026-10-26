@@ -2,7 +2,7 @@
 
 An agentic AI system that takes natural-language requests from business users and automates routine data work: answering questions with SQL and running small ETL jobs. It works against **any PostgreSQL database**. An Ola-style ride-booking dataset is the bundled demo.
 
-Status: in progress. Phases 1 (foundation) and 2 (SQL Analyst) are done and verified against live models, with Langfuse tracing working. Phase 3 (eval harness) is done. Phase 4 (ETL Analyst) is built; see Appendix B. See Appendix B.
+Status: in progress. Phases 1 (foundation) and 2 (SQL Analyst) are done and verified against live models, with Langfuse tracing working. Phase 3 (eval harness) is done. Phase 4 (ETL Analyst) and Phase 5 (parent router and `chat`) are built. See Appendix B.
 
 ---
 
@@ -171,16 +171,23 @@ A tool-calling agent that decides which tools to run, in what order, from a plai
 
 ## 5. Parent Data Agent
 
-One structured-output call returning:
+A LangGraph graph with one routing node and three destinations. The router makes one structured-output call (high tier, because a wrong route is costly and the prompt is small) returning:
 
 ```python
-class Route(BaseModel):
-    target: Literal["sql_analyst", "etl_analyst", "refuse"]
-    reason: str
-    request: str  # cleaned request forwarded to the child
+class RouteDecision(BaseModel):
+    route: Literal["sql", "etl", "both", "chat", "clarify"]
+    sql_question: str  # standalone question for the SQL Analyst
+    etl_request: str  # standalone task for the ETL Analyst
+    reply: str  # text for chat / clarify
 ```
 
-The parent holds the conversation history, passes the relevant slice to the child, and formats the child's result for the user. Out-of-scope requests (for example "delete all rides") are refused with a reason.
+- The router prompt lists the specialists, the allow-listed API hosts and the tables currently visible to the SQL Analyst, so it can tell what data exists and does not invent limits.
+- An incomplete decision (for example `route="sql"` with no question) gets one corrective retry, then stops with a "please rephrase" message. The router never guesses.
+- `both` runs the ETL Analyst first and the SQL Analyst only if the load succeeded. If the load fails or is refused, the SQL step is skipped so it never analyses data that was not loaded.
+- The router has no database or HTTP access. Routing is not a security layer: a misrouted request still meets the SQL safety checks, the database roles and the ETL host allow-list.
+- `ChatSession` holds the history (last 10 messages). Only successful, non-small-talk turns enter it: chat replies are left out so a wrong self-description cannot steer later routing; clarifying questions stay in so the user's answer has context.
+- The run config (Langfuse callbacks, request and session ids) is passed into both children, so a turn is one trace. A JSONL line per turn records the route, status and latency.
+- `datapilot eval routing` checks 20 routing cases (one model call each). Unsafe requests (delete, export, prompt injection) must end in `chat`, never in a load or query of that data.
 
 ---
 
@@ -295,7 +302,8 @@ Versions are locked in `uv.lock`. LangChain, LangGraph and Langfuse change quick
 
 | Command | Purpose |
 |---|---|
-| `datapilot chat` (planned, Phase 5) | Interactive session with the parent agent. Shows the answer, then the SQL and trace id on request. |
+| `datapilot chat ["message"]` | Talk to the parent agent. With a message it answers once and exits (`--json` available); without one it opens an interactive session with `/sql`, `/clear` and `/quit`. |
+| `datapilot eval routing` | Score the router on 20 labelled messages. |
 | `datapilot ask "<question>"` | One-shot question to the SQL Analyst; prints the answer and result table. Add `--show-sql` or `--json`. Exits non-zero on refusal or failure. |
 | `datapilot demo load` | Create the demo schema and generate synthetic data. |
 | `datapilot db apply-grants` | Generate and apply role grants from `hints.yaml`. |
@@ -448,7 +456,7 @@ datapilot/
 2. **SQL Analyst (done):** safety layers, nodes, graph, retries, `ask` command, JSONL tracing, tests with a scripted LLM, and live verification on Groq. Langfuse v3 tracing verified end to end.
 3. **Eval harness (done):** 20 answerable and 9 safety cases, result-set scoring against reference SQL, run history and comparison, Langfuse scores.
 4. **ETL Analyst (done):** tools, ReAct agent, staging-only writes, atomic loads. Live-verified on Groq `gpt-oss-120b` with Open-Meteo: 12 cities × 30 days = 360 rows, re-run leaves 360 (idempotent), deletion / webhook-exfiltration / non-allow-listed-host requests are refused, and the SQL Analyst joins `staging.weather_daily` to bookings. A load takes about 100 to 130 s on the free tier, mostly per-minute token limits.
-5. **Parent router:** routing, conversation loop.
+5. **Parent router (done):** `RouteDecision` router, `both` (load then analyse), conversation history, `datapilot chat`, `eval routing`. Live-verified on Groq: SQL questions with follow-ups, small talk, a delete request declined, and a combined load-then-analyse request whose load succeeded (360 rows). The analyse half of that last request could not be run live because the free daily quota ran out; it is covered by tests with the real SQL Analyst. Routing accuracy was 19 to 20 of 20 over four runs, with the unsafe cases always correct.
 6. **Polish and portability:**
    - `datapilot db setup`: create the roles, `staging` schema and grants on any existing database from an admin URL, with role and database names as parameters, and verify that the read-only role cannot write.
    - Startup guard: refuse to run the SQL agent if its role can write or is a superuser.

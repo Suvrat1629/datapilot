@@ -173,6 +173,116 @@ def etl(
         raise typer.Exit(1)
 
 
+CHAT_HELP = "Commands: /sql toggle SQL display, /clear forget the conversation, /quit exit."
+
+
+def _render_turn(turn, show_sql: bool, request_id: str, latency: float) -> None:
+    if turn.sql is not None and turn.status == "ok" and turn.route == "sql":
+        _render_result(turn.sql, show_sql, request_id, latency)
+        return
+    border = {"ok": "green", "refused": "yellow"}.get(turn.status, "red")
+    console.print(
+        Panel(Markdown(turn.text), title=f"DataPilot ({turn.route})", border_style=border)
+    )
+    if turn.etl is not None:
+        for ld in turn.etl.loads:
+            console.print(f"[green]Loaded[/] staging.{ld.table}: {ld.rows} rows")
+    if turn.sql is not None and turn.status == "ok" and turn.sql.rows:
+        t = RichTable()
+        for c in turn.sql.columns:
+            t.add_column(c)
+        for r in turn.sql.rows[:MAX_TABLE_ROWS]:
+            t.add_row(*(str(r[c]) for c in turn.sql.columns))
+        console.print(t)
+    if show_sql and turn.sql is not None and turn.sql.sql:
+        console.print("[bold]SQL[/bold]")
+        console.print(turn.sql.sql, markup=False, highlight=False, soft_wrap=True)
+    console.print(
+        f"[dim]{turn.status}   route={turn.route}   {latency:.1f}s   "
+        f"{turn.llm_calls} model calls   trace {request_id}[/dim]",
+        highlight=False,
+    )
+
+
+@app.command()
+def chat(
+    message: str | None = typer.Argument(
+        None, help="Send one message and exit. Omit to start an interactive chat."
+    ),
+    show_sql: bool = typer.Option(False, "--show-sql", help="Print the SQL that was run."),
+    as_json: bool = typer.Option(False, "--json", help="Print the turn as JSON (one message)."),
+) -> None:
+    """Talk to DataPilot: it routes each message to the SQL or ETL analyst."""
+    import dataclasses
+
+    from datapilot.parent.graph import ChatSession
+    from datapilot.tracing import log_turn
+
+    session = ChatSession()
+    session_id = new_request_id()
+
+    def one(text: str) -> object:
+        request_id = new_request_id()
+        start = time.monotonic()
+        turn = session.turn(
+            text, config=langfuse_config(request_id, session_id=session_id, tags=["chat"])
+        )
+        latency = time.monotonic() - start
+        log_turn(turn, request_id, session_id, latency)
+        flush_langfuse()
+        if as_json:
+            payload = {
+                "message": turn.message,
+                "route": turn.route,
+                "status": turn.status,
+                "text": turn.text,
+                "llm_calls": turn.llm_calls,
+                "sql": turn.sql.model_dump(mode="json", exclude={"schema_context", "history"})
+                if turn.sql
+                else None,
+                "etl": dataclasses.asdict(turn.etl) if turn.etl else None,
+                "request_id": request_id,
+                "latency_s": round(latency, 2),
+            }
+            typer.echo(json.dumps(payload, default=str))
+        else:
+            _render_turn(turn, show_sql, request_id, latency)
+        return turn
+
+    if message is not None:
+        if not message.strip():
+            raise typer.BadParameter("message is empty")
+        turn = one(message)
+        if turn.status != "ok":  # type: ignore[attr-defined]
+            raise typer.Exit(1)
+        return
+
+    console.print(f"[bold]DataPilot chat[/bold]  {CHAT_HELP}")
+    while True:
+        try:
+            text = console.input("[bold cyan]you>[/] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            break
+        if not text:
+            continue
+        if text in ("/quit", "/exit"):
+            break
+        if text == "/clear":
+            session.clear()
+            console.print("[dim]Conversation cleared.[/dim]")
+        elif text == "/sql":
+            show_sql = not show_sql
+            console.print(f"[dim]SQL display {'on' if show_sql else 'off'}.[/dim]")
+        elif text.startswith("/"):
+            console.print(f"[dim]Unknown command. {CHAT_HELP}[/dim]")
+        else:
+            try:
+                one(text)
+            except KeyboardInterrupt:
+                console.print("[yellow]Interrupted.[/yellow]")
+
+
 # ---- eval ---------------------------------------------------------------------------------
 
 
@@ -287,6 +397,36 @@ def eval_run(
         )
     console.print(f"Saved: {path}")
     if aborted or not integrity[0] or not all(checks.values()):
+        raise typer.Exit(1)
+
+
+@eval_app.command("routing")
+def eval_routing(
+    high: str | None = typer.Option(None, help="Override LLM_HIGH (provider:model)."),
+) -> None:
+    """Check that the parent router sends each message to the right specialist."""
+    from datapilot.etl_analyst import http
+    from datapilot.eval.routing import run_routing_eval
+
+    if high:
+        os.environ["LLM_HIGH"] = high
+        get_settings.cache_clear()
+    from datapilot.parent.graph import ParentDeps, _table_names
+
+    settings = get_settings()
+    results = run_routing_eval(
+        hosts=sorted(http.allowed_hosts(settings)),
+        tables=_table_names(ParentDeps(settings=settings)),
+    )
+    for r in results:
+        mark = "[green]\u2714[/]" if r.passed else "[red]\u2716[/]"
+        extra = f"  {r.error}" if r.error else ""
+        console.print(
+            f" {mark} {r.id:<20} expected={r.expect:<8} got={r.got:<8} {r.latency_s:.1f}s{extra}"
+        )
+    passed = sum(r.passed for r in results)
+    console.print(f"\nRouting accuracy: {passed}/{len(results)}")
+    if passed < len(results):
         raise typer.Exit(1)
 
 
