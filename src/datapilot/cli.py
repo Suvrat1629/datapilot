@@ -40,6 +40,7 @@ def demo_load() -> None:
     with db.connect("admin") as admin:
         counts = generate(admin)
         granted = db.apply_grants(admin, hints)
+        db.apply_etl_grants(admin, hints, _split(get_settings().etl_readable_columns))
 
     t = RichTable(title="Demo data loaded")
     t.add_column("what")
@@ -58,8 +59,11 @@ def db_apply_grants() -> None:
         for w in db.check_hints(admin, hints):
             console.print(f"[yellow]warning:[/yellow] {w}")
         granted = db.apply_grants(admin, hints)
+        etl = db.apply_etl_grants(admin, hints, _split(get_settings().etl_readable_columns))
     for table, cols in granted.items():
         console.print(f"[bold]{table}[/bold]: {', '.join(cols)}")
+    for table, cols in etl.items():
+        console.print(f"ETL role may read [bold]{table}[/bold]: {', '.join(cols)}")
     if hints.hidden_columns:
         console.print(f"Hidden: {', '.join(hints.hidden_columns)}")
 
@@ -131,6 +135,41 @@ def ask(
     else:
         _render_result(state, show_sql, request_id, latency)
     if state.status != "ok":
+        raise typer.Exit(1)
+
+
+@app.command()
+def etl(
+    request: str = typer.Argument(..., help="A data-loading task, in plain English."),
+    as_json: bool = typer.Option(False, "--json", help="Print the full result as JSON."),
+) -> None:
+    """Load data from an allow-listed public API into the staging schema."""
+    import dataclasses
+
+    from datapilot.etl_analyst.agent import run_etl_analyst
+
+    request_id = new_request_id()
+    start = time.monotonic()
+    res = run_etl_analyst(request, config=langfuse_config(request_id, tags=["etl"]))
+    latency = time.monotonic() - start
+    flush_langfuse()
+
+    if as_json:
+        payload = dataclasses.asdict(res)
+        payload.update(request_id=request_id, latency_s=round(latency, 2))
+        typer.echo(json.dumps(payload, default=str))
+    else:
+        if res.status == "ok":
+            for ld in res.loads:
+                console.print(f"[green]Loaded[/] staging.{ld.table}: {ld.rows} rows")
+            console.print(Panel(res.summary or "Done.", title="ETL"))
+        else:
+            console.print(Panel(res.reason or res.summary, title=res.status, border_style="red"))
+        console.print(
+            f"[dim]request {request_id} - {res.llm_calls} model calls, "
+            f"{len(res.tool_calls)} tool calls, {res.fetches} HTTP requests, {latency:.1f}s[/]"
+        )
+    if res.status != "ok":
         raise typer.Exit(1)
 
 

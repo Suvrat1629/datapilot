@@ -26,7 +26,15 @@ class Settings(BaseSettings):
     max_llm_calls_per_request: int = 12
     max_context_chars: int = 12_000
     judge_enabled: bool = True
-    etl_allowed_hosts: str = ""
+    etl_allowed_hosts: str = ""  # comma-separated exact hostnames; empty means deny all
+    # "table.column" entries the ETL role may read from public (column-level grants applied by
+    # `datapilot db apply-grants`). Empty means the ETL role reads nothing outside staging.
+    etl_readable_columns: str = ""
+    etl_max_steps: int = 20  # model calls per ETL request
+    etl_max_fetches: int = 50  # HTTP requests per ETL request (including for_each fan-out)
+    etl_max_rows: int = 100_000  # rows per staging load
+    etl_max_response_bytes: int = 5_000_000
+    etl_fetch_timeout_s: float = 15.0
     hints_path: str = ""
 
     langfuse_host: str = ""
@@ -39,7 +47,7 @@ def get_settings() -> Settings:
     return Settings()
 
 
-def get_llm(tier: Tier, temperature: float = 0.0):
+def get_llm(tier: Tier, temperature: float = 0.0, max_retries: int | None = None):
     """Build the chat model for a tier from its `provider:model` setting.
 
     Imports are lazy so the DB-only parts of the project work without LLM keys.
@@ -55,7 +63,10 @@ def get_llm(tier: Tier, temperature: float = 0.0):
     if provider == "groq":
         from langchain_groq import ChatGroq
 
-        return ChatGroq(model=model, temperature=temperature, api_key=s.groq_api_key or None)
+        extra = {} if max_retries is None else {"max_retries": max_retries}
+        return ChatGroq(
+            model=model, temperature=temperature, api_key=s.groq_api_key or None, **extra
+        )
     if provider in ("google", "gemini"):
         from langchain_google_genai import ChatGoogleGenerativeAI
 

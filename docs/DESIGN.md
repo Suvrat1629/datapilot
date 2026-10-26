@@ -2,7 +2,7 @@
 
 An agentic AI system that takes natural-language requests from business users and automates routine data work: answering questions with SQL and running small ETL jobs. It works against **any PostgreSQL database**. An Ola-style ride-booking dataset is the bundled demo.
 
-Status: in progress. Phases 1 (foundation) and 2 (SQL Analyst) are done and verified against live models, with Langfuse tracing working. Phase 3 (eval harness) is done. Phase 4 (ETL Analyst) is next. See Appendix B.
+Status: in progress. Phases 1 (foundation) and 2 (SQL Analyst) are done and verified against live models, with Langfuse tracing working. Phase 3 (eval harness) is done. Phase 4 (ETL Analyst) is built; see Appendix B. See Appendix B.
 
 ---
 
@@ -148,15 +148,20 @@ A tool-calling agent that decides which tools to run, in what order, from a plai
 
 | Tool | Purpose |
 |---|---|
-| `fetch_api(url, params)` | HTTP GET with an allow-listed host set, timeout, and response size cap. Returns a handle to the raw data. |
-| `inspect_data(handle)` | Preview columns, types, and sample rows. |
-| `transform(handle, spec)` | Declarative pandas transforms (rename, cast, filter, join, aggregate), not arbitrary code execution. |
-| `load_staging(handle, table)` | Write to the `staging` schema only. Creates or replaces the table. |
-| `list_tables()` | Show the tables the ETL role can see: `staging` plus any explicitly granted reference tables. |
+| `list_tables()` | Tables and columns the ETL role can read: `staging` plus explicitly granted reference columns. |
+| `read_reference(table, columns, limit)` | Read granted reference columns (for example city names) into a dataset handle. |
+| `fetch_api(url, params, data_path, for_each, tag_columns)` | HTTPS GET to allow-listed hosts. With `for_each=<handle>` the request repeats once per row using `{column}` placeholders, so geocoding 12 cities is one tool call. `data_path` locates the rows; an object of parallel arrays (Open-Meteo `daily`) becomes rows. |
+| `inspect_data(handle)` | Preview columns, types, and sample rows. The model only ever sees handles and previews. |
+| `transform(handle, steps)` | Typed steps: rename, select, drop, cast, filter, add_column, aggregate, sort, dedupe, limit. No joins or code execution. |
+| `load_staging(handle, table)` | Atomically replace `staging.<table>`. |
+| `refuse(reason)` | Decline a request that is not a safe loading task. |
 
 **Guardrails**
 - Writes only through the ETL role, which has `CREATE`/`INSERT` on `staging` and no write access to source tables.
-- **No exfiltration path.** The ETL role does **not** get `SELECT` on source tables; it can read only `staging` and reference tables explicitly granted. The grant mechanism does not exist yet (the init script gives the ETL role no access to `public`); Phase 4 must add it, for example an `ETL_READABLE_TABLES` setting applied by `apply-grants`, so the ETL agent can read the list of cities without seeing customer data. `fetch_api` parameters and URLs are built from the user's request and validated by code: they may not contain values taken from database reads, and hosts are allow-listed. Data from external APIs flows into the database, never the other way out.
+- **Exfiltration boundary is the database grant, not parameter checks.** The ETL role can read only the columns listed in `ETL_READABLE_COLUMNS` (for the demo `cities.id,cities.name,cities.state`), applied as column-level `SELECT` by `apply_etl_grants` (`demo load` and `db apply-grants`). Hidden columns, nonexistent columns and malformed entries are rejected at grant time. Reference values (a city name) legitimately appear in API requests; the grant limits what can ever be read, so nothing sensitive can be sent out.
+- **Outbound HTTP:** exact-match HTTPS host allow-list (`ETL_ALLOWED_HOSTS`, empty denies all), no credentials in URLs, standard port only, redirects not followed, streamed response size cap, request timeout, and a per-task request cap (`ETL_MAX_FETCHES`).
+- **Step cap:** `ETL_MAX_STEPS` bounds the agent loop (LangGraph recursion limit); hitting it, a provider error or a quota error ends the task as `failed` with a reason.
+- API responses are treated as data; the model has no tool that can execute them.
 - **Idempotent, atomic loads.** `load_staging` writes to a temporary table inside a transaction, then swaps it in with an atomic rename (`BEGIN; ... ALTER TABLE ... RENAME; COMMIT`). A failure midway rolls back and leaves the previous table untouched. Re-running the same request produces the same table, not duplicates. Each load records a row in `staging._loads` (table, source, row count, timestamp, status).
 - No arbitrary code execution: transforms are a typed spec interpreted by our code.
 - Max tool-call steps per request.
@@ -314,7 +319,10 @@ Versions are locked in `uv.lock`. LangChain, LangGraph and Langfuse change quick
 | `MAX_CONTEXT_CHARS` | 12000 | Schema context cap before table selection kicks in. |
 | `JUDGE_ENABLED` | true | Turn the LLM judge off if it over-rejects on small models. |
 | `MAX_LLM_CALLS_PER_REQUEST` | 12 | Hard cap, protects free-tier quotas. |
-| `ETL_ALLOWED_HOSTS` | empty (deny all) | Comma-separated allow-list for `fetch_api`. |
+| `ETL_ALLOWED_HOSTS` | empty (deny all) | Comma-separated exact hostnames for `fetch_api`. |
+| `ETL_READABLE_COLUMNS` | empty | `table.column` list the ETL role may read. |
+| `ETL_MAX_STEPS` / `ETL_MAX_FETCHES` | 20 / 50 | Agent step cap and HTTP requests per task. |
+| `ETL_MAX_ROWS` / `ETL_MAX_RESPONSE_BYTES` / `ETL_FETCH_TIMEOUT_S` | 100000 / 5000000 / 15 | Load, response and timeout limits. |
 | `HINTS_PATH` | empty (no hints) | Optional domain hints file. The Ola demo hints are bundled at `src/datapilot/demo/hints.yaml`. A set but missing path is an error. |
 | `LANGFUSE_HOST` | `http://localhost:3001` | Self-hosted Langfuse URL. Tracing is skipped if unset. |
 | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | none | Project keys. For the local stack, the values in `.env` also seed the project on first start (dev only). |
@@ -404,7 +412,7 @@ The callback interface is generic, so LangSmith could replace Langfuse by swappi
 | CLI vs web UI | CLI first; Streamlit later if wanted. |
 | Langfuse stack is heavy (6 containers) | Optional profile; the JSONL log works without it. The server and SDK majors (v3 and v5) must be upgraded together. |
 | Provider free-tier quotas | Gemini: 20 requests/day/model, so Groq is the default for both tiers; fail fast on daily-quota errors. |
-| ETL role cannot read the city list it needs | Add an explicit reference-table grant in Phase 4. |
+| ETL role cannot read the city list it needs | Solved: column-level grants from `ETL_READABLE_COLUMNS`. |
 
 ---
 
@@ -427,7 +435,7 @@ datapilot/
     cli.py
     demo/{generate.py,hints.yaml}
     sql_analyst/{state,context,nodes,graph,safety}.py
-    etl_analyst/{tools,agent}.py      # Phase 4
+    etl_analyst/{store,http,transforms,load,tools,agent}.py
     parent/{router,graph}.py          # Phase 5
   tests/
 ```
@@ -439,7 +447,7 @@ datapilot/
 1. **Foundation (done):** scaffold, Postgres in Docker, roles, synthetic data, introspection.
 2. **SQL Analyst (done):** safety layers, nodes, graph, retries, `ask` command, JSONL tracing, tests with a scripted LLM, and live verification on Groq. Langfuse v3 tracing verified end to end.
 3. **Eval harness (done):** 20 answerable and 9 safety cases, result-set scoring against reference SQL, run history and comparison, Langfuse scores.
-4. **ETL Analyst:** tools, ReAct agent, staging-only writes.
+4. **ETL Analyst (done):** tools, ReAct agent, staging-only writes, atomic loads. Live-verified on Groq `gpt-oss-120b` with Open-Meteo: 12 cities × 30 days = 360 rows, re-run leaves 360 (idempotent), deletion / webhook-exfiltration / non-allow-listed-host requests are refused, and the SQL Analyst joins `staging.weather_daily` to bookings. A load takes about 100 to 130 s on the free tier, mostly per-minute token limits.
 5. **Parent router:** routing, conversation loop.
 6. **Polish and portability:**
    - `datapilot db setup`: create the roles, `staging` schema and grants on any existing database from an admin URL, with role and database names as parameters, and verify that the read-only role cannot write.

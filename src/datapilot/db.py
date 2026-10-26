@@ -35,9 +35,28 @@ class Column:
 class Table:
     name: str
     columns: list[Column]
+    schema: str = "public"
+
+    @property
+    def qualified(self) -> str:
+        """Name to use in SQL and prompts: staging tables must be schema-qualified."""
+        return self.name if self.schema == "public" else f"{self.schema}.{self.name}"
 
 
-def introspect(conn: psycopg.Connection, hints: Hints, schema: str = "public") -> list[Table]:
+DEFAULT_SCHEMAS = ("public", "staging")
+
+
+def introspect(
+    conn: psycopg.Connection, hints: Hints, schemas: tuple[str, ...] = DEFAULT_SCHEMAS
+) -> list[Table]:
+    """Introspect every schema in `schemas` (tables loaded by the ETL agent live in staging)."""
+    tables: list[Table] = []
+    for schema in schemas:
+        tables.extend(_introspect_schema(conn, hints, schema))
+    return tables
+
+
+def _introspect_schema(conn: psycopg.Connection, hints: Hints, schema: str) -> list[Table]:
     """Read the schema as the connected role sees it.
 
     information_schema only lists columns the role has privileges on, so with the
@@ -90,7 +109,9 @@ def introspect(conn: psycopg.Connection, hints: Hints, schema: str = "public") -
     tables: dict[str, Table] = {}
     for r in cols:
         t, c = r["table_name"], r["column_name"]
-        if hints.is_hidden(t, c):
+        if t.startswith("_"):  # internal bookkeeping such as staging._loads
+            continue
+        if schema == "public" and hints.is_hidden(t, c):
             continue
         col = Column(
             name=c,
@@ -99,7 +120,7 @@ def introspect(conn: psycopg.Connection, hints: Hints, schema: str = "public") -
             is_pk=(t, c) in pks,
             fk=fks.get((t, c)),
         )
-        tables.setdefault(t, Table(t, [])).columns.append(col)
+        tables.setdefault(t, Table(t, [], schema)).columns.append(col)
 
     for table in tables.values():
         for col in table.columns:
@@ -122,8 +143,8 @@ def render_schema_context(tables: list[Table], hints: Hints) -> str:
     """Plain-text schema description for the LLM prompt."""
     lines: list[str] = []
     for t in tables:
-        th = hints.tables.get(t.name)
-        header = f"TABLE {t.name}"
+        th = hints.tables.get(t.name) if t.schema == "public" else None
+        header = f"TABLE {t.qualified}"
         if th and th.description:
             header += f" -- {th.description}"
         lines.append(header)
@@ -203,3 +224,57 @@ def apply_grants(
         granted[table] = columns
     admin.commit()
     return granted
+
+
+def apply_etl_grants(
+    admin: psycopg.Connection, hints: Hints, columns: list[str], schema: str = "public"
+) -> dict[str, list[str]]:
+    """Let the ETL role read only the listed "table.column" entries from `schema`.
+
+    Revokes everything first, so re-running is idempotent and removing an entry removes the
+    grant. Refuses hidden columns and entries that do not exist, instead of skipping them.
+    """
+    by_table: dict[str, list[str]] = {}
+    for ref in columns:
+        table, _, col = ref.partition(".")
+        if not table or not col:
+            raise ValueError(f"ETL_READABLE_COLUMNS entry {ref!r} must look like table.column")
+        if hints.is_hidden(table, col):
+            raise ValueError(f"{ref} is a hidden column and cannot be made readable to ETL")
+        by_table.setdefault(table, []).append(col)
+
+    existing = {
+        (r["table_name"], r["column_name"])
+        for r in admin.execute(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = %s",
+            (schema,),
+        )
+    }
+    missing = [ref for ref in columns if tuple(ref.split(".", 1)) not in existing]
+    if missing:
+        raise ValueError(f"ETL_READABLE_COLUMNS names columns that do not exist: {missing}")
+
+    admin.execute(
+        sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM datapilot_etl").format(
+            sql.Identifier(schema)
+        )
+    )
+    if by_table:
+        admin.execute(
+            sql.SQL("GRANT USAGE ON SCHEMA {} TO datapilot_etl").format(sql.Identifier(schema))
+        )
+    else:
+        admin.execute(
+            sql.SQL("REVOKE USAGE ON SCHEMA {} FROM datapilot_etl").format(sql.Identifier(schema))
+        )
+    for table, cols in by_table.items():
+        admin.execute(
+            sql.SQL("GRANT SELECT ({cols}) ON {s}.{t} TO datapilot_etl").format(
+                cols=sql.SQL(", ").join(sql.Identifier(c) for c in cols),
+                s=sql.Identifier(schema),
+                t=sql.Identifier(table),
+            )
+        )
+    admin.commit()
+    return by_table
