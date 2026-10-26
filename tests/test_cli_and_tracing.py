@@ -87,3 +87,32 @@ def test_ask_json_output_is_parseable(monkeypatch, tmp_path):
     payload = json.loads(r.output)
     assert payload["status"] == "ok" and payload["rows"][0]["n"] == 1342
     assert "schema_context" not in payload and payload["request_id"]
+
+
+def test_flush_is_a_noop_without_langfuse_config(monkeypatch):
+    monkeypatch.setattr(
+        tracing,
+        "get_settings",
+        lambda: type(
+            "S", (), {"langfuse_host": "", "langfuse_public_key": "", "langfuse_secret_key": ""}
+        )(),
+    )
+    tracing.flush_langfuse()  # must not raise or import the SDK
+
+
+def test_langfuse_setup_failure_is_swallowed(monkeypatch):
+    monkeypatch.setattr(
+        tracing,
+        "get_settings",
+        lambda: type(
+            "S",
+            (),
+            {"langfuse_host": "http://x", "langfuse_public_key": "pk", "langfuse_secret_key": "sk"},
+        )(),
+    )
+    import langfuse
+
+    monkeypatch.setattr(
+        langfuse, "Langfuse", lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    assert tracing.langfuse_config("id") == {}

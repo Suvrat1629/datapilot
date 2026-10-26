@@ -13,7 +13,7 @@ from datapilot import db
 from datapilot.config import get_settings
 from datapilot.hints import DEMO_HINTS_PATH, load_hints
 from datapilot.sql_analyst.graph import run_sql_analyst
-from datapilot.tracing import langfuse_config, log_request, new_request_id
+from datapilot.tracing import flush_langfuse, langfuse_config, log_request, new_request_id
 
 app = typer.Typer(
     help="DataPilot: natural-language SQL and ETL agents over PostgreSQL.", no_args_is_help=True
@@ -117,6 +117,7 @@ def ask(
     state = run_sql_analyst(question, config=langfuse_config(request_id))
     latency = time.monotonic() - start
     log_request(state, request_id, latency)
+    flush_langfuse()
 
     if as_json:
         payload = state.model_dump(mode="json", exclude={"schema_context", "history"})

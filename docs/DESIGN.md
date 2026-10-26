@@ -2,7 +2,7 @@
 
 An agentic AI system that takes natural-language requests from business users and automates routine data work: answering questions with SQL and running small ETL jobs. It works against **any PostgreSQL database**. An Ola-style ride-booking dataset is the bundled demo.
 
-Status: in progress. Phases 1 (foundation) and 2 (SQL Analyst) are done and verified against live models. Phase 3 (eval harness) is next. See Appendix B.
+Status: in progress. Phases 1 (foundation) and 2 (SQL Analyst) are done and verified against live models, with Langfuse tracing working. Phase 3 (eval harness) is next. See Appendix B.
 
 ---
 
@@ -268,7 +268,7 @@ GOOGLE_API_KEY=...
 | Layer | Technology | Role |
 |---|---|---|
 | Agent orchestration | **LangGraph** | `StateGraph` for the SQL Analyst and the parent graph. |
-| LLM abstraction | **LangChain** (`langchain-core`; `langchain` is added in Phase 4 for `create_agent`, the ReAct agent factory that replaces the deprecated `langgraph.prebuilt.create_react_agent`) | Chat model interface, structured output, tool definitions, the ETL ReAct agent. |
+| LLM abstraction | **LangChain** (`langchain-core`; `langchain` is installed for `create_agent`, the ReAct agent factory for Phase 4 that replaces the deprecated `langgraph.prebuilt.create_react_agent`) | Chat model interface, structured output, tool definitions, the ETL ReAct agent. |
 | LLM providers | `langchain-groq`, `langchain-google-genai` | Groq (default for both tiers) and Gemini (fallback); swappable via config. |
 | Data models | **Pydantic v2** | Graph state, `Route`, `SqlDraft`, `SafetyVerdict`, settings (`pydantic-settings`). |
 | Database | **PostgreSQL 16** (Docker) | Demo and target database. |
@@ -316,7 +316,7 @@ Versions are locked in `uv.lock`. LangChain, LangGraph and Langfuse change quick
 | `ETL_ALLOWED_HOSTS` | empty (deny all) | Comma-separated allow-list for `fetch_api`. |
 | `HINTS_PATH` | empty (no hints) | Optional domain hints file. The Ola demo hints are bundled at `src/datapilot/demo/hints.yaml`. A set but missing path is an error. |
 | `LANGFUSE_HOST` | `http://localhost:3001` | Self-hosted Langfuse URL. Tracing is skipped if unset. |
-| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | none | Project keys created in the Langfuse UI. |
+| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | none | Project keys. For the local stack, the values in `.env` also seed the project on first start (dev only). |
 
 **Error handling contract.** Every request ends in one of three statuses, returned to the user with a plain-language reason: `ok`, `refused` (unsafe, out of scope, or hidden data), or `failed` (retries exhausted, provider outage, timeout). The agent never returns an answer from a query that did not run successfully.
 
@@ -362,7 +362,7 @@ Agentic systems fail in ways that are only visible in a trace, so every request 
 - generated SQL, safety verdicts with reasons, and an `attempt_log` with one entry per SQL attempt (the SQL and why it failed: DB error, judge objection, or refusal);
 - final answer and status (`ok`, `refused`, `failed`).
 
-**Langfuse (primary).** A self-hosted Langfuse instance runs in Docker Compose next to Postgres. The Langfuse LangChain callback handler is attached to every graph invocation, so each node's prompt, response, latency, token count and cost appear as one trace with nested spans. The request id is passed as trace metadata; richer tags and scores (route, safety verdict, attempt number) and Langfuse datasets for eval runs are planned. **Status: not working yet.** Checked against the running server: the installed Python SDK (v5) exports traces to `/api/public/otel/v1/traces`, which the self-hosted v2.95 server in `docker-compose.yml` answers with 404 (it only has the older `/api/public/ingestion` endpoint). The handler is wired in but guarded, so a failure only logs a warning. Fix by either pinning the SDK to v2 (`langfuse<3`, whose compatibility with the installed `langchain-core` is unverified) or moving the server to Langfuse v3 (adds ClickHouse, Redis and S3-compatible storage).
+**Langfuse (primary).** A self-hosted Langfuse instance runs in Docker Compose next to Postgres. The Langfuse LangChain callback handler is attached to every graph invocation, so each node's prompt, response, latency, token count and cost appear as one trace with nested spans. The request id is passed as trace metadata; richer tags and scores (route, safety verdict, attempt number) and Langfuse datasets for eval runs are planned. **Status: working.** The server is Langfuse v3 (web, worker, ClickHouse, Redis, MinIO and Postgres under `--profile observability`) with the Python SDK v5. A first run showed one trace per request containing all six graph nodes and each model call with model name, token counts and latency; the request id is attached as trace metadata. The project, API keys and a dev login are seeded on first start through Langfuse's headless initialisation, so no manual UI setup is needed. The CLI flushes the SDK before exiting, because the SDK exports in the background and a short-lived process would otherwise drop the trace. History: SDK v5 exports to the OTLP endpoint `/api/public/otel/v1/traces`, which a v2 server does not have (404), and the v2 SDK cannot be used instead because its LangChain handler imports modules (`langchain.callbacks.base`, `langchain.schema.*`) that LangChain 1.x removed.
 
 **JSONL log (offline fallback).** Each request also appends one line to `logs/traces.jsonl` with request id, curated question, final SQL, safety verdict, the per-attempt log, status, token totals and latency (the route is added when the parent router exists). The planned eval runner will read this file, so evals work without Langfuse running. If Langfuse is not configured or its setup fails, the agent logs a warning and continues; observability must never break a request.
 
@@ -391,7 +391,7 @@ The callback interface is generic, so LangSmith could replace Langfuse by swappi
 | Cost on large schemas | Table selection; cap context size. |
 | Which API for the ETL demo? | Default: Open-Meteo (free, no key), joined to rides by city and date. |
 | CLI vs web UI | CLI first; Streamlit later if wanted. |
-| Langfuse SDK v5 vs self-hosted server v2 | Confirmed incompatible (OTLP endpoint returns 404). Pin the SDK to v2 or upgrade the server to v3; tracing is off until then. |
+| Langfuse stack is heavy (6 containers) | Optional profile; the JSONL log works without it. The server and SDK majors (v3 and v5) must be upgraded together. |
 | Provider free-tier quotas | Gemini: 20 requests/day/model, so Groq is the default for both tiers; fail fast on daily-quota errors. |
 | ETL role cannot read the city list it needs | Add an explicit reference-table grant in Phase 4. |
 
@@ -402,7 +402,7 @@ The callback interface is generic, so LangSmith could replace Langfuse by swappi
 ```
 datapilot/
   docs/DESIGN.md
-  docker-compose.yml          # Postgres 16; Langfuse v2 + its own DB under --profile observability
+  docker-compose.yml          # Postgres 16; Langfuse v3 stack (web, worker, ClickHouse, Redis, MinIO, DB) under --profile observability
   db/init/                    # roles, staging schema, load log
   pyproject.toml, uv.lock
   .env.example
@@ -426,7 +426,7 @@ datapilot/
 ## Appendix B. Build phases
 
 1. **Foundation (done):** scaffold, Postgres in Docker, roles, synthetic data, introspection.
-2. **SQL Analyst (done):** safety layers, nodes, graph, retries, `ask` command, JSONL tracing, tests with a scripted LLM, and live verification on Groq. Langfuse tracing is carried forward (see Observability).
+2. **SQL Analyst (done):** safety layers, nodes, graph, retries, `ask` command, JSONL tracing, tests with a scripted LLM, and live verification on Groq. Langfuse v3 tracing verified end to end.
 3. **Eval harness:** the 20-question eval set and runner, so prompt and model choices are measured.
 4. **ETL Analyst:** tools, ReAct agent, staging-only writes.
 5. **Parent router:** routing, conversation loop.

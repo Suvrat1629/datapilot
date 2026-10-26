@@ -1,3 +1,25 @@
+x-langfuse-env: &langfuse-env
+  DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+  SALT: dev-only-salt-change-me
+  # 64 hex chars; dev only
+  ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+  TELEMETRY_ENABLED: "false"
+  CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+  CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+  CLICKHOUSE_USER: clickhouse
+  CLICKHOUSE_PASSWORD: clickhouse
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  REDIS_HOST: langfuse-redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: langfuse-redis
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+
 services:
   postgres:
     image: postgres:16
@@ -31,21 +53,82 @@ services:
       timeout: 3s
       retries: 10
 
+  langfuse-clickhouse:
+    profiles: [observability]
+    image: clickhouse/clickhouse-server:24.3
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - langfuse_clickhouse:/var/lib/clickhouse
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  langfuse-redis:
+    profiles: [observability]
+    image: redis:7
+    command: ["redis-server", "--requirepass", "langfuse-redis", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "langfuse-redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  langfuse-minio:
+    profiles: [observability]
+    image: cgr.dev/chainguard/minio
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    volumes:
+      - langfuse_minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  langfuse-worker:
+    profiles: [observability]
+    image: langfuse/langfuse-worker:3
+    depends_on: &langfuse-deps
+      langfuse-db: {condition: service_healthy}
+      langfuse-clickhouse: {condition: service_healthy}
+      langfuse-redis: {condition: service_healthy}
+      langfuse-minio: {condition: service_healthy}
+    environment: *langfuse-env
+
   langfuse:
     profiles: [observability]
-    image: langfuse/langfuse:2
-    depends_on:
-      langfuse-db:
-        condition: service_healthy
+    image: langfuse/langfuse:3
+    depends_on: *langfuse-deps
     ports:
       - "3001:3000"
     environment:
-      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      <<: *langfuse-env
       NEXTAUTH_URL: http://localhost:3001
       NEXTAUTH_SECRET: dev-only-secret-change-me
-      SALT: dev-only-salt-change-me
-      TELEMETRY_ENABLED: "false"
+      # Headless init: creates the org, project, API keys and a login on first start.
+      LANGFUSE_INIT_ORG_ID: datapilot
+      LANGFUSE_INIT_ORG_NAME: DataPilot
+      LANGFUSE_INIT_PROJECT_ID: datapilot
+      LANGFUSE_INIT_PROJECT_NAME: datapilot
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-datapilot-dev}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-datapilot-dev}
+      LANGFUSE_INIT_USER_EMAIL: admin@datapilot.local
+      LANGFUSE_INIT_USER_NAME: admin
+      LANGFUSE_INIT_USER_PASSWORD: datapilot-dev
 
 volumes:
   datapilot_pg:
   langfuse_pg:
+  langfuse_clickhouse:
+  langfuse_minio:

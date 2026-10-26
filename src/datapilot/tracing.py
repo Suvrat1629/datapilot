@@ -72,3 +72,17 @@ def langfuse_config(request_id: str) -> dict[str, Any]:
     except Exception as e:  # SDK/server version mismatch, network, bad keys
         log.warning("Langfuse tracing disabled: %s", e)
         return {}
+
+
+def flush_langfuse() -> None:
+    """Send buffered traces. The SDK exports in the background, so a short-lived process
+    must flush before exiting or the trace is lost."""
+    s = get_settings()
+    if not (s.langfuse_host and s.langfuse_public_key and s.langfuse_secret_key):
+        return
+    try:
+        from langfuse import get_client
+
+        get_client().flush()
+    except Exception as e:
+        log.warning("Langfuse flush failed: %s", e)
