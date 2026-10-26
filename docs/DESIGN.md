@@ -118,10 +118,10 @@ class SqlState(BaseModel):
     curated_question: str | None = None
     schema_context: str | None = None
     sql: str | None = None
-    safety: SafetyVerdict | None = None   # ok: bool, reason: str
+    safety: SafetyVerdict | None = None  # ok: bool, reason: str
     rows: list[dict] | None = None
     error: str | None = None
-    attempts: int = 0                     # capped at MAX_SQL_RETRIES (default 2)
+    attempts: int = 0  # capped at MAX_SQL_RETRIES (default 2)
     answer: str | None = None
 ```
 
@@ -159,7 +159,7 @@ One structured-output call returning:
 class Route(BaseModel):
     target: Literal["sql_analyst", "etl_analyst", "refuse"]
     reason: str
-    request: str   # cleaned request forwarded to the child
+    request: str  # cleaned request forwarded to the child
 ```
 
 The parent holds the conversation history, passes the relevant slice to the child, and formats the child's result for the user. Out-of-scope requests (for example "delete all rides") are refused with a reason.
@@ -284,17 +284,17 @@ Versions are pinned in `pyproject.toml` and the `uv.lock` file once Phase 1 crea
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DATABASE_URL` | none | Read-only role connection. |
-| `ETL_DATABASE_URL` | none | ETL role connection. |
+| `DATABASE_URL` | required | Read-only role connection. No default, so a missing value fails fast. |
+| `ETL_DATABASE_URL` | required | ETL role connection. |
 | `LLM_LOW`, `LLM_HIGH` | see Models | `provider:model` per tier. |
 | `GROQ_API_KEY`, `GOOGLE_API_KEY` | none | Provider keys. |
 | `MAX_SQL_RETRIES` | 2 | Retry cap in the SQL Analyst. |
 | `MAX_ROWS` | 1000 | Authoritative row cap. |
 | `STATEMENT_TIMEOUT_MS` | 10000 | Query timeout on the read-only role. |
 | `MAX_LLM_CALLS_PER_REQUEST` | 12 | Hard cap, protects free-tier quotas. |
-| `ETL_ALLOWED_HOSTS` | `api.open-meteo.com` | Comma-separated allow-list for `fetch_api`. |
-| `HINTS_PATH` | `hints.yaml` | Optional domain hints. |
-| `LANGFUSE_HOST` | `http://localhost:3000` | Self-hosted Langfuse URL. Tracing is skipped if unset. |
+| `ETL_ALLOWED_HOSTS` | empty (deny all) | Comma-separated allow-list for `fetch_api`. |
+| `HINTS_PATH` | empty (no hints) | Optional domain hints file. The Ola demo hints are bundled at `src/datapilot/demo/hints.yaml`. A set but missing path is an error. |
+| `LANGFUSE_HOST` | `http://localhost:3001` | Self-hosted Langfuse URL. Tracing is skipped if unset. |
 | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | none | Project keys created in the Langfuse UI. |
 
 **Error handling contract.** Every request ends in one of three statuses, returned to the user with a plain-language reason: `ok`, `refused` (unsafe, out of scope, or hidden data), or `failed` (retries exhausted, provider outage, timeout). The agent never returns an answer from a query that did not run successfully.
@@ -396,8 +396,13 @@ datapilot/
 
 ## Appendix B. Build phases
 
-1. **Foundation:** scaffold, Postgres in Docker, roles, synthetic data, introspection.
-2. **SQL Analyst:** graph, safety layers, retries, tests.
-3. **ETL Analyst:** tools, ReAct agent, staging-only writes.
-4. **Parent router:** routing, conversation loop.
-5. **CLI, evals, README.**
+1. **Foundation (done):** scaffold, Postgres in Docker, roles, synthetic data, introspection.
+2. **SQL Analyst:** safety layers, nodes, graph, retries, tests.
+3. **Eval harness:** the 20-question eval set and runner, so prompt and model choices are measured.
+4. **ETL Analyst:** tools, ReAct agent, staging-only writes.
+5. **Parent router:** routing, conversation loop.
+6. **Polish and portability:**
+   - `datapilot db setup`: create the roles, `staging` schema and grants on any existing database from an admin URL, with role and database names as parameters, and verify that the read-only role cannot write.
+   - Startup guard: refuse to run the SQL agent if its role can write or is a superuser.
+   - Guard on `demo load` so it cannot drop tables in a non-demo database.
+   - Multi-schema support (introspection is limited to `public` today), README, adversarial tests.

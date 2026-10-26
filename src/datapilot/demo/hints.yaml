@@ -1,0 +1,20 @@
+tables:
+  bookings:
+    description: One row per ride request.
+    columns:
+      status: One of completed, cancelled, no_show.
+      cancel_reason: Set only when status = 'cancelled'.
+      fare_amount: Final fare in INR; null when the ride was not completed.
+      distance_km: Trip distance in kilometres.
+  cities:
+    description: Cities where the service operates.
+  customers:
+    description: Registered riders.
+  drivers:
+    description: Registered drivers.
+  payments:
+    description: One row per completed booking payment.
+
+hidden_columns:
+  - customers.phone
+  - customers.email
