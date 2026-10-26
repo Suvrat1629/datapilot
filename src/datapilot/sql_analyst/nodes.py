@@ -132,10 +132,16 @@ class SqlAnalystNodes:
     def curate_question(self, state: SqlState) -> dict[str, Any]:
         human = f"Chat history:\n{self._history_text(state) or '(none)'}\n\n"
         human += f"Latest message: {state.user_question}"
+        messages = [SystemMessage(CURATE_SYSTEM), HumanMessage(human)]
         try:
-            out, usage = self._call(
-                state, "low", CuratedQuestion, [SystemMessage(CURATE_SYSTEM), HumanMessage(human)]
-            )
+            out, usage = self._call(state, "low", CuratedQuestion, messages)
+            if not out.answerable or not out.question.strip():
+                # The small model sometimes refuses plain data questions. Refusing is costly for
+                # the user, so confirm with the stronger model before giving up.
+                second, usage = self._call(
+                    state.model_copy(update=usage), "high", CuratedQuestion, messages
+                )
+                out = second
         except BudgetExceeded:
             return self._fail("Too many model calls for one request.")
         except LLMError as e:

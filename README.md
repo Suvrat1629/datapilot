@@ -61,6 +61,20 @@ uv run datapilot etl "Load the last 30 days of daily temperature for every city 
 uv run datapilot chat "Which city is hottest in staging.weather_daily?"
 ```
 
+### Web chat
+
+```bash
+cd web && npm install && npm run build && cd ..   # once
+uv run datapilot serve                            # http://127.0.0.1:8000
+```
+
+A chat UI with saved conversations, live progress ("Writing SQL", "Fetching data from ..."),
+result tables with CSV download, automatic bar/line charts, and a collapsible SQL view. For
+frontend development run `npm run dev` in `web/` (port 5173) next to `datapilot serve`.
+The server has no login, so it listens on `127.0.0.1` only; do not expose it. It runs the same
+role guard as the CLI and refuses to serve if the database roles are too powerful.
+Conversations are saved in `data/chats.db` (`CHAT_DB_PATH`).
+
 Optional tracing with Langfuse: `docker compose --profile observability up -d`, UI on
 <http://localhost:3001>. Without it, each request is still logged to `logs/traces.jsonl`.
 
@@ -83,6 +97,7 @@ tables.
 
 | Command | Purpose |
 |---|---|
+| `serve` | Web chat on `http://127.0.0.1:8000` (build the frontend first). |
 | `chat ["message"]` | Interactive chat, or one message with `--json`. Chat commands: `/sql`, `/clear`, `/quit`. |
 | `ask "question"` | SQL Analyst only. `--show-sql`, `--json`. |
 | `etl "request"` | ETL Analyst only. |
@@ -121,4 +136,4 @@ The full design, trade-offs and phase history are in [`docs/DESIGN.md`](docs/DES
   agents report this instead of crashing.
 - The ETL agent loads JSON from allow-listed APIs only; no joins between fetched datasets yet.
 - The staging load log (`staging._loads`) is readable by the SQL role.
-- No web UI yet; the CLI is the interface.
+- The web UI is single-user and local: no login, plain-text rendering of answers, and charts are chosen by simple rules (bar for categories, line for dates).

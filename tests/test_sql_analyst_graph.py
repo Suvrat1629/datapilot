@@ -49,11 +49,30 @@ def test_models_are_tiered():
     assert tiers[CuratedQuestion] == "low" and tiers[JudgeVerdict] == "low" and tiers[None] == "low"
 
 
-def test_not_a_question_is_refused_without_more_calls():
-    llm = ScriptedLLM().curate(ok=False, reason="That asks to delete data.")
+def test_not_a_question_is_refused_after_the_stronger_model_agrees():
+    llm = (
+        ScriptedLLM()
+        .curate(ok=False, reason="small model")
+        .curate(ok=False, reason="That asks to delete data.")
+    )
     st = run_sql_analyst("delete all rides", deps=make(llm))
     assert st.status == "refused" and "delete" in st.reason
-    assert len(llm.calls) == 1
+    assert [c[0] for c in llm.calls] == ["low", "high"]  # no SQL was ever written
+    assert llm.count(SqlDraft) == 0
+
+
+def test_false_refusal_by_the_small_model_is_overruled():
+    llm = (
+        ScriptedLLM()
+        .curate(ok=False, reason="not a question")
+        .curate("Top 5 cities by bookings?")
+        .sql("SELECT count(*) AS n FROM cities")
+        .judge(True)
+        .answer("Five cities.")
+    )
+    st = run_sql_analyst("Show total bookings per city, top 5", deps=make(llm))
+    assert st.status == "ok" and st.curated_question == "Top 5 cities by bookings?"
+    assert st.llm_calls == 5
 
 
 @pytest.mark.parametrize(

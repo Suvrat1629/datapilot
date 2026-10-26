@@ -7,3 +7,7 @@ logs/
 .ruff_cache/
 dist/
 evals/runs/
+
+data/
+web/node_modules/
+web/dist/

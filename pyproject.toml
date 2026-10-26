@@ -7,6 +7,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.162.0",
     "httpx>=0.28.1",
     "langchain>=1.4.7",
     "langchain-core>=1.7.0",
@@ -22,6 +23,7 @@ dependencies = [
     "rich>=15.0.0",
     "sqlglot>=30.24.0",
     "typer>=0.27.3",
+    "uvicorn>=0.54.0",
 ]
 
 [project.scripts]

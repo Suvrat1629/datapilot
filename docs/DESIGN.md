@@ -2,7 +2,7 @@
 
 An agentic AI system that takes natural-language requests from business users and automates routine data work: answering questions with SQL and running small ETL jobs. It works against **any PostgreSQL database**. An Ola-style ride-booking dataset is the bundled demo.
 
-Status: all six phases are built and tested; the web UI is deferred. Phases 1 to 3 (foundation, SQL Analyst, eval harness) were verified against live models, Phase 4 (ETL) and Phase 5 (router and `chat`) against Groq and Open-Meteo, and Phase 6 (portability, role guard, multi-schema, README) with scratch-database tests. See Appendix B.
+Status: all six phases and the web UI are built and tested. Phases 1 to 3 (foundation, SQL Analyst, eval harness) were verified against live models, Phase 4 (ETL) and Phase 5 (router and `chat`) against Groq and Open-Meteo, and Phase 6 (portability, role guard, multi-schema, README) with scratch-database tests. See Appendix B.
 
 ---
 
@@ -188,6 +188,17 @@ class RouteDecision(BaseModel):
 - `ChatSession` holds the history (last 10 messages). Only successful, non-small-talk turns enter it: chat replies are left out so a wrong self-description cannot steer later routing; clarifying questions stay in so the user's answer has context.
 - The run config (Langfuse callbacks, request and session ids) is passed into both children, so a turn is one trace. A JSONL line per turn records the route, status and latency.
 - `datapilot eval routing` checks 20 routing cases (one model call each). Unsafe requests (delete, export, prompt injection) must end in `chat`, never in a load or query of that data.
+
+---
+
+### Web interface
+
+`datapilot serve` runs a FastAPI app (`src/datapilot/web/`) and serves the React/Vite frontend built in `web/dist`. It is a thin layer over `ChatSession`; limits, the router and every safety check are the same as in the CLI.
+
+- **Streaming:** `POST /api/chats/{id}/messages` returns server-sent events: `start`, `step` (live progress), `step_error`, and a final `result`. Progress comes from a LangChain callback handler that maps known graph nodes and tool names to fixed labels (for example "Writing SQL", "Fetching data from api.open-meteo.com"), so no raw model or database output is streamed as a label. Turns run in a worker thread that saves the reply even if the browser disconnects; every failure still ends in a `result` event.
+- **Saved conversations:** SQLite (`data/chats.db`). Router history is rebuilt from the database each turn using the same rule as `ChatSession` (`counts_for_history`), so it survives restarts.
+- **One payload shape:** `turn_payload` (also used by `chat --json`) carries the answer, SQL, capped rows, a chart spec and any loads. `suggest_chart` is a pure function (bar for one category column, line for one date column, 1 to 3 measures); a future visualisation agent can replace it without touching the API or UI.
+- **Safety:** binds to `127.0.0.1` by default (no login). The role guard runs at startup; if it fails every API route returns 503 with the reasons. Cross-site writes are refused (Origin check) and CORS allows only the Vite dev origin. One turn per conversation at a time (409 otherwise). The UI renders all text as plain text, never HTML.
 
 ---
 
@@ -449,6 +460,7 @@ datapilot/
     llm.py                    # structured output, repair, backoff
     tracing.py                # JSONL log, optional Langfuse
     cli.py
+    web/{app,events,store}.py   # FastAPI app, progress steps, saved chats
     demo/{generate.py,hints.yaml}
     sql_analyst/{state,context,nodes,graph,safety}.py
     guard.py                  # role safety checks (startup and `db check`)

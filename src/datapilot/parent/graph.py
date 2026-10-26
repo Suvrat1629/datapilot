@@ -23,6 +23,13 @@ from datapilot.sql_analyst.state import SqlState
 HISTORY_LIMIT = 10  # messages kept in a chat session
 
 
+def counts_for_history(status: str, route: str, text: str) -> bool:
+    """Only successful turns enter history; failures teach later turns nothing true. Small talk
+    is skipped too: a chat reply that misstates what the assistant can do would otherwise steer
+    later routing."""
+    return status == "ok" and bool(text) and route != "chat"
+
+
 @dataclass
 class ParentDeps:
     """External pieces of the parent, substitutable in tests."""
@@ -191,10 +198,7 @@ class ChatSession:
         status = out.status or "failed"
         shown = out.text if status == "ok" else (out.reason or "Something went wrong.")
         route = out.decision.route if out.decision else "none"
-        # Only successful turns enter history; failures would teach later turns nothing true.
-        # Small talk is skipped too: a chat reply that misstates what the assistant can do would
-        # otherwise steer later routing.
-        if status == "ok" and shown and route != "chat":
+        if counts_for_history(status, route, shown):
             self.history += [
                 {"role": "user", "content": message},
                 {"role": "assistant", "content": shown},

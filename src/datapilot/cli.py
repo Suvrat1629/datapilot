@@ -272,6 +272,39 @@ def ask(
 
 
 @app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", help="Address to listen on (there is no login)."),
+    port: int = typer.Option(8000, help="Port to listen on."),
+) -> None:
+    """Run the web chat (API plus the built frontend from web/dist)."""
+    import uvicorn
+
+    from datapilot import guard
+    from datapilot.web.app import create_app
+    from datapilot.web.store import ChatStore
+
+    settings = get_settings()
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        console.print(
+            "[yellow]Warning:[/yellow] the web app has no login. Anyone who can reach "
+            f"{host}:{port} can query your database and trigger data loads."
+        )
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    if not (dist / "index.html").exists():
+        console.print(
+            "[yellow]No built frontend found.[/yellow] Run `npm install && npm run build` in "
+            "web/, or use `npm run dev` there and open http://localhost:5173."
+        )
+    api = create_app(
+        store=ChatStore(settings.chat_db_path),
+        guard=lambda: guard.ensure_safe(("ro", "etl")),
+        static_dir=dist,
+    )
+    console.print(f"DataPilot web on http://{host}:{port}")
+    uvicorn.run(api, host=host, port=port, log_level="warning")
+
+
+@app.command()
 def etl(
     request: str = typer.Argument(..., help="A data-loading task, in plain English."),
     as_json: bool = typer.Option(False, "--json", help="Print the full result as JSON."),
@@ -348,9 +381,9 @@ def chat(
 ) -> None:
     """Talk to DataPilot: it routes each message to the SQL or ETL analyst."""
     _require_safe_roles("ro", "etl")
-    import dataclasses
 
     from datapilot.parent.graph import ChatSession
+    from datapilot.parent.serialize import turn_payload
     from datapilot.tracing import log_turn
 
     session = ChatSession()
@@ -366,19 +399,7 @@ def chat(
         log_turn(turn, request_id, session_id, latency)
         flush_langfuse()
         if as_json:
-            payload = {
-                "message": turn.message,
-                "route": turn.route,
-                "status": turn.status,
-                "text": turn.text,
-                "llm_calls": turn.llm_calls,
-                "sql": turn.sql.model_dump(mode="json", exclude={"schema_context", "history"})
-                if turn.sql
-                else None,
-                "etl": dataclasses.asdict(turn.etl) if turn.etl else None,
-                "request_id": request_id,
-                "latency_s": round(latency, 2),
-            }
+            payload = turn_payload(turn, request_id, latency)
             typer.echo(json.dumps(payload, default=str))
         else:
             _render_turn(turn, show_sql, request_id, latency)

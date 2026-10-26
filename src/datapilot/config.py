@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     etl_max_response_bytes: int = 5_000_000
     etl_fetch_timeout_s: float = 15.0
     hints_path: str = ""
+    chat_db_path: str = "data/chats.db"  # saved web conversations (SQLite)
     # Schemas the agent may read, comma-separated. `staging` (ETL output) is always included.
     schemas: str = "public"
     ro_role: str = "datapilot_ro"  # role behind DATABASE_URL
