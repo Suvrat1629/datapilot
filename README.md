@@ -11,13 +11,62 @@ you> Load the last 30 days of weather for every city, then which city is hottest
 
 The bundled demo is an Ola-style ride-booking dataset. Nothing in the agents is specific to it.
 
-## How it works
+## Architecture
 
+```mermaid
+flowchart TB
+    WEB["Web chat<br/>React + Vite"] -- "live steps (SSE)" --> API["FastAPI<br/>saved chats in SQLite"]
+    CLI["CLI<br/>chat, ask, etl"]
+    API --> ROUTER
+    CLI --> ROUTER
+
+    subgraph AGENTS["Agents (LangGraph / LangChain)"]
+        ROUTER("Router<br/>sql, etl, both, chat, clarify")
+        SQL["SQL Analyst<br/>stateful graph"]
+        ETL["ETL Analyst<br/>tool-calling agent"]
+        REPLY("Direct reply")
+        ROUTER -- "data question" --> SQL
+        ROUTER -- "load data" --> ETL
+        ROUTER -- "small talk, unclear,<br/>or declined" --> REPLY
+        ETL -. "load, then analyse" .-> SQL
+    end
+
+    SQL -- "role: read-only" --> SRC
+    ETL -- "role: ETL<br/>allow-listed columns only" --> SRC
+    ETL -- "role: ETL<br/>writes here only" --> STG
+    SQL -- "read-only" --> STG
+    ETL -- "HTTPS, exact hosts only" --> EXT[("Public JSON APIs<br/>e.g. Open-Meteo")]
+
+    subgraph PG["PostgreSQL"]
+        SRC[("Your tables<br/>column-level SELECT")]
+        STG[("staging schema<br/>ETL output")]
+    end
+
+    GUARD["Role guard<br/>refuses over-powered roles"] -. "checked at startup" .-> PG
+    AGENTS -.-> LLM["LLM providers<br/>Groq, Gemini"]
+    AGENTS -.-> LF["Langfuse traces<br/>(optional)"]
 ```
-                    +--> SQL Analyst  (LangGraph: curate, schema, generate, safety, run, answer)
-chat --> Router ----+--> ETL Analyst  (tool-calling agent: read, fetch, transform, load)
-                    +--> direct reply / clarifying question
+
+### SQL Analyst pipeline
+
+```mermaid
+flowchart LR
+    Q([Question]) --> CUR["Curate<br/>standalone question"]
+    CUR --> CTX["Schema context<br/>tables, hints, samples"]
+    CTX --> GEN["Generate SQL"]
+    GEN --> STATIC{"Static check<br/>single SELECT, allow-listed<br/>schemas, no risky functions"}
+    STATIC -- refused --> NO(["Refuse with reason"])
+    STATIC -- ok --> JUDGE{"Judge<br/>answers the question?"}
+    JUDGE -- "objects (retry)" --> GEN
+    JUDGE -- ok --> RUN["Run as read-only role<br/>timeout + row cap"]
+    RUN -- "error (retry)" --> GEN
+    RUN -- "permission denied" --> NO
+    RUN -- rows --> ANS["Write the answer"]
+    ANS --> OUT([Answer + table + chart])
 ```
+
+Safety does not depend on the prompts: the database roles are the boundary, and the checks in the
+diagram are extra layers on top.
 
 - **SQL Analyst**: a stateful graph. Generated SQL passes a static check, then runs as a database
   role that can only `SELECT`. Failed queries are retried with the error fed back.
