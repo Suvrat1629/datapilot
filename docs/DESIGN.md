@@ -2,7 +2,7 @@
 
 An agentic AI system that takes natural-language requests from business users and automates routine data work: answering questions with SQL and running small ETL jobs. It works against **any PostgreSQL database**. An Ola-style ride-booking dataset is the bundled demo.
 
-Status: draft, pre-implementation.
+Status: in progress. Phase 1 (foundation) is done; Phase 2 (SQL Analyst) is built and tested with a scripted LLM, with live-model verification pending API keys. See Appendix B.
 
 ---
 
@@ -66,7 +66,7 @@ flowchart LR
 |---|---|---|
 | Parent Data Agent | Single structured-output LLM call (Pydantic `Route`) | Routing is a classification, not a reasoning loop. Cheap and testable. |
 | SQL Analyst | LangGraph `StateGraph` | Fixed, auditable steps with branching and retries; state is the point. |
-| ETL Analyst | ReAct (`create_react_agent`) | Tool choice is open-ended and needs no complex state. |
+| ETL Analyst | ReAct (`langchain.agents.create_agent`) | Tool choice is open-ended and needs no complex state. |
 
 ---
 
@@ -77,11 +77,15 @@ Based on the project architecture diagram, with two additions: a **retry loop on
 ```mermaid
 flowchart TD
     S([Start]) --> CQ[Curate question<br/>LLM low]
+    CQ -- not a data question --> END1
     CQ --> AC[Add context<br/>schema + hints + samples]
     AC --> GS[Generate SQL<br/>LLM high]
     GS --> SF{Safe?<br/>1 static checks<br/>2 LLM judge}
-    SF -- No --> END1([End: refusal with reason])
+    SF -- static check failed --> END1([End: refusal with reason])
+    SF -- judge objects, retries left --> GS
+    SF -- judge objects, retries exhausted --> END2
     SF -- Yes --> RUN[Run query<br/>read-only, timeout, row cap]
+    RUN -- permission denied --> END1
     RUN -- error, retries left --> GS
     RUN -- error, retries exhausted --> END2([End: failure with reason])
     RUN -- ok --> REP[Represent results<br/>LLM low]
@@ -95,34 +99,43 @@ flowchart TD
 
 | Node | Model tier | Responsibility |
 |---|---|---|
-| `curate_question` | low (Haiku) | Normalise the request: resolve pronouns and follow-ups using chat history, strip noise, reject non-questions. |
-| `add_context` | none | Fetch schema from `information_schema`: tables, columns, types, PK/FK, a few sample values. If the schema is large, select relevant tables first. Merge optional domain hints. |
-| `generate_sql` | high (Sonnet) | Produce one SQL query as structured output (`SqlDraft`: `sql`, `assumptions`). On retry, receives the previous SQL and the database error. |
-| `safety_check` | none + low | Layer 1: deterministic. Layer 2: LLM judge for intent (see below). |
-| `run_query` | none | Execute with the read-only role, `statement_timeout`, and a row limit. |
-| `represent` | low (Haiku) | Turn rows into a short answer, a table, and the SQL used. |
+| `curate_question` | low | Normalise the request: resolve pronouns and follow-ups using chat history, strip noise, reject non-questions. |
+| `add_context` | none | Read the schema as the read-only role sees it (`information_schema` for columns, `pg_catalog` for keys): tables, columns, types, PK/FK, and the distinct values of low-cardinality text columns. If the rendered schema exceeds `MAX_CONTEXT_CHARS`, keep the tables that best match the question (keyword overlap) plus their FK neighbours. Merge optional domain hints. |
+| `generate_sql` | high | Produce one SQL query as structured output (`SqlDraft`: `sql`, `assumptions`). On retry, receives the previous SQL and the database error. |
+| `safety_check` | none + low | Layer 1: deterministic; a failure ends the run with a refusal. Layer 2: LLM judge for intent; an objection is a wrong query, not a malicious one, so it goes back to `generate_sql` with the reason (same retry cap). The judge can be turned off with `JUDGE_ENABLED=false`. |
+| `run_query` | none | Execute with the read-only role, `statement_timeout`, and a row limit. A Postgres permission error ends the run as a refusal; other database errors go back to `generate_sql`. |
+| `represent` | low | Turn rows into a 1-3 sentence answer. The CLI renders the result table and, on request, the SQL. If this call fails, a plain "the query returned N rows" answer is used so a successful query is never lost. |
 
 ### Safety layers
 
-1. **Static check (`sqlglot`)**: parse with the Postgres dialect. Require exactly one statement and a `SELECT` (CTEs allowed). Reject DDL/DML, `COPY`, `SELECT INTO`, and calls to a deny-list of functions (`pg_read_file`, `pg_sleep`, `dblink`, `lo_*`, and similar). If the query has no `LIMIT`, inject one as an optimization only (see "Row limit" below).
-2. **Database enforcement**: connect as a role that has only `SELECT` on allowed schemas, with `statement_timeout` and `default_transaction_read_only = on`. **Sensitive columns are enforced here too**: the read-only role gets column-level `GRANT SELECT (col, ...)` that omits hidden columns (or reads through views that exclude them). A query touching `customers.phone` fails in Postgres regardless of what the LLM or the parser thinks. This is the real security boundary; layer 1 is defense in depth.
+1. **Static check (`sqlglot`)**: parse with the Postgres dialect. Require exactly one statement and a `SELECT` (CTEs and set operations allowed). Walk the whole parse tree and reject DDL/DML, `COPY`, `SET`, transactions, `GRANT`, `SELECT INTO`, `FOR UPDATE`, and data-modifying CTEs (these hide inside a root that parses as a plain `SELECT`). Reject a deny-list of functions (`pg_read_file`, `pg_sleep`, `set_config`, `current_setting`, `dblink*`, `lo_*`, advisory locks, and similar). Allow only the `public` and `staging` schemas, which also blocks `pg_catalog`, `information_schema` and cross-database references. Refuse early any query naming a hidden column (matched by column name, so it can over-block a same-named column elsewhere). If the query has no `LIMIT`, inject one (see "Row limit" below).
+2. **Database enforcement**: connect as a role that has only `SELECT` on allowed tables and columns. Role-level defaults (`default_transaction_read_only = on`, `statement_timeout`) add friction but are not hard limits, because a session can change them; the missing privileges are the hard limit, and layer 1 blocks `SET` statements. `run_query` also applies `STATEMENT_TIMEOUT_MS` per session. **Sensitive columns are enforced here too**: the read-only role gets column-level `GRANT SELECT (col, ...)` that omits hidden columns (or reads through views that exclude them). A query touching `customers.phone` fails in Postgres regardless of what the LLM or the parser thinks. This is the real security boundary; layer 1 is defense in depth.
 3. **LLM judge**: checks only that the SQL answers the curated question. It catches wrong queries, not malicious ones, and is never relied on for security.
 
-**Row limit:** `run_query` is authoritative. It fetches at most `MAX_ROWS` rows (default 1000) with `fetchmany` and reports truncation to the user. The injected `LIMIT` in layer 1 just saves the database work.
+**Row limit:** `run_query` is authoritative. It fetches at most `MAX_ROWS` rows (default 1000) with `fetchmany` and reports truncation to the user. The injected `LIMIT` in layer 1 is `MAX_ROWS + 1`, so `run_query` can tell "exactly the cap" from "more than the cap" and set the truncation flag; it also saves the database work.
 
 ### State
 
 ```python
 class SqlState(BaseModel):
     user_question: str
+    history: list[dict[str, str]] = []     # prior turns, for follow-up questions
     curated_question: str | None = None
     schema_context: str | None = None
     sql: str | None = None
-    safety: SafetyVerdict | None = None  # ok: bool, reason: str
+    assumptions: list[str] = []
+    safety: SafetyVerdict | None = None    # ok: bool, reason: str
+    columns: list[str] = []
     rows: list[dict] | None = None
-    error: str | None = None
-    attempts: int = 0  # capped at MAX_SQL_RETRIES (default 2)
+    truncated: bool = False
+    feedback: str | None = None            # judge objection or DB error fed back to generate_sql
+    attempts: int = 0                      # SQL generations; capped at 1 + MAX_SQL_RETRIES
+    llm_calls: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
     answer: str | None = None
+    status: Literal["ok", "refused", "failed"] | None = None
+    reason: str = ""
 ```
 
 ---
@@ -139,11 +152,11 @@ A tool-calling agent that decides which tools to run, in what order, from a plai
 | `inspect_data(handle)` | Preview columns, types, and sample rows. |
 | `transform(handle, spec)` | Declarative pandas transforms (rename, cast, filter, join, aggregate), not arbitrary code execution. |
 | `load_staging(handle, table)` | Write to the `staging` schema only. Creates or replaces the table. |
-| `list_tables()` | Show existing tables so the agent can plan joins. |
+| `list_tables()` | Show the tables the ETL role can see: `staging` plus any explicitly granted reference tables. |
 
 **Guardrails**
 - Writes only through the ETL role, which has `CREATE`/`INSERT` on `staging` and no write access to source tables.
-- **No exfiltration path.** The ETL role does **not** get `SELECT` on source tables; it can read only `staging` and non-sensitive reference tables explicitly granted. `fetch_api` parameters and URLs are built from the user's request and validated by code: they may not contain values taken from database reads, and hosts are allow-listed. Data from external APIs flows into the database, never the other way out.
+- **No exfiltration path.** The ETL role does **not** get `SELECT` on source tables; it can read only `staging` and reference tables explicitly granted. The grant mechanism does not exist yet (the init script gives the ETL role no access to `public`); Phase 4 must add it, for example an `ETL_READABLE_TABLES` setting applied by `apply-grants`, so the ETL agent can read the list of cities without seeing customer data. `fetch_api` parameters and URLs are built from the user's request and validated by code: they may not contain values taken from database reads, and hosts are allow-listed. Data from external APIs flows into the database, never the other way out.
 - **Idempotent, atomic loads.** `load_staging` writes to a temporary table inside a transaction, then swaps it in with an atomic rename (`BEGIN; ... ALTER TABLE ... RENAME; COMMIT`). A failure midway rolls back and leaves the previous table untouched. Re-running the same request produces the same table, not duplicates. Each load records a row in `staging._loads` (table, source, row count, timestamp, status).
 - No arbitrary code execution: transforms are a typed spec interpreted by our code.
 - Max tool-call steps per request.
@@ -183,11 +196,11 @@ Request: *"Which city had the most cancellations last week?"*
    GROUP BY c.name ORDER BY cancellations DESC LIMIT 1;
    ```
 5. **safety_check**: one `SELECT`, no denied functions, no hidden columns; judge confirms it answers the question. Verdict: safe.
-6. **run_query**: executes as the read-only role in 40 ms and returns `[("Bengaluru", 1342)]`.
+6. **run_query**: executes as the read-only role in 40 ms and returns `[("Bengaluru", 1342)]` (illustrative values).
 7. **represent** (low): "Bengaluru had the most cancellations last week, with 1,342." Shows the SQL and the stated assumption (week means the previous Monday-to-Sunday).
 8. **Trace** in Langfuse (and the JSONL log) records the route, curated question, SQL, verdict, attempts (1), latency, and token usage.
 
-If step 6 had failed with `column "created_at" does not exist`, the error goes back to `generate_sql` for attempt 2. If step 5 had judged the SQL unsafe, the run ends with the reason and nothing executes.
+If step 6 had failed with `column "created_at" does not exist`, the error goes back to `generate_sql` for attempt 2. If step 5 had failed the static check (for example a `DROP`), the run ends with a refusal and the reason, and nothing executes. If only the judge had objected, the objection goes back to `generate_sql` the same way.
 
 ---
 
@@ -197,8 +210,8 @@ If step 6 had failed with `column "created_at" does not exist`, the error goes b
 |---|---|
 | Schema | Discovered at runtime from `information_schema` and `pg_catalog`. Nothing hard-coded. |
 | Domain knowledge | Optional `hints.yaml`: table/column descriptions, business definitions, units, sensitive columns. |
-| Large schemas | A table-selection step: embed or LLM-rank table descriptions, include only the top N plus their FK neighbours. |
-| Connection | `DATABASE_URL` for the read-only role; `ETL_DATABASE_URL` for the ETL role. |
+| Large schemas | Table selection when the schema exceeds `MAX_CONTEXT_CHARS`: keyword overlap between the question and table, column and hint text, plus FK neighbours. Embedding or LLM ranking is a possible upgrade. |
+| Connection | `DATABASE_URL` (read-only role), `ETL_DATABASE_URL` (ETL role), `ADMIN_DATABASE_URL` (setup only: demo load and grants). |
 | Demo data | `datapilot demo load` generates the synthetic Ola-style dataset. The demo is the only place that knows about rides. |
 
 Example `hints.yaml`:
@@ -221,7 +234,7 @@ hidden_columns:          # enforced via column-level grants; also removed from s
 
 ## 8. Models
 
-The project is **provider-agnostic**. Each tier is configured as `provider:model` through environment variables and built by one factory (`config.get_llm(tier)`), so no node knows which vendor it is talking to. Supported providers: Groq (`langchain-groq`), Google Gemini (`langchain-google-genai`), and any other LangChain chat model.
+The project is **provider-agnostic**. Each tier is configured as `provider:model` through environment variables and built by one factory (`config.get_llm(tier)`), so no node knows which vendor it is talking to. Supported providers today: Groq (`langchain-groq`) and Google Gemini (`langchain-google-genai`). Adding another LangChain chat model is one new branch in `get_llm`.
 
 | Tier | Default | Used for |
 |---|---|---|
@@ -249,8 +262,8 @@ GOOGLE_API_KEY=...
 
 | Layer | Technology | Role |
 |---|---|---|
-| Agent orchestration | **LangGraph** | `StateGraph` for the SQL Analyst; prebuilt ReAct agent for ETL; parent graph that wires them together. |
-| LLM abstraction | **LangChain** (`langchain-core`) | Chat model interface, structured output, tool definitions, prompt templates. |
+| Agent orchestration | **LangGraph** | `StateGraph` for the SQL Analyst and the parent graph. |
+| LLM abstraction | **LangChain** (`langchain-core`; `langchain` is added in Phase 4 for `create_agent`, the ReAct agent factory that replaces the deprecated `langgraph.prebuilt.create_react_agent`) | Chat model interface, structured output, tool definitions, the ETL ReAct agent. |
 | LLM providers | `langchain-groq`, `langchain-google-genai` | Groq and Gemini free tiers; swappable via config. |
 | Data models | **Pydantic v2** | Graph state, `Route`, `SqlDraft`, `SafetyVerdict`, settings (`pydantic-settings`). |
 | Database | **PostgreSQL 16** (Docker) | Demo and target database. |
@@ -262,7 +275,7 @@ GOOGLE_API_KEY=...
 | Tooling | `uv`, Python 3.12, `pytest`, `ruff` | Environment, tests, lint. |
 | Packaging | Docker Compose | Postgres plus init scripts. |
 
-Versions are pinned in `pyproject.toml` and the `uv.lock` file once Phase 1 creates them. LangChain and LangGraph change quickly, so the pins matter.
+Versions are locked in `uv.lock`. LangChain, LangGraph and Langfuse change quickly, so the lock matters.
 
 ---
 
@@ -272,25 +285,28 @@ Versions are pinned in `pyproject.toml` and the `uv.lock` file once Phase 1 crea
 
 | Command | Purpose |
 |---|---|
-| `datapilot chat` | Interactive session with the parent agent. Shows the answer, then the SQL and trace id on request. |
-| `datapilot ask "<question>"` | One-shot question; prints the answer. Add `--show-sql`. |
+| `datapilot chat` (planned, Phase 5) | Interactive session with the parent agent. Shows the answer, then the SQL and trace id on request. |
+| `datapilot ask "<question>"` | One-shot question to the SQL Analyst; prints the answer and result table. Add `--show-sql` or `--json`. Exits non-zero on refusal or failure. |
 | `datapilot demo load` | Create the demo schema and generate synthetic data. |
 | `datapilot db apply-grants` | Generate and apply role grants from `hints.yaml`. |
 | `datapilot db schema` | Print the schema context exactly as the agent sees it. |
-| `datapilot eval` | Run the eval set and print accuracy, latency, and token use. |
-| `datapilot trace <id>` | Print one request from the JSONL log, with a link to its Langfuse trace. |
+| `datapilot eval` (planned, Phase 3) | Run the eval set and print accuracy, latency, and token use. |
+| `datapilot trace <id>` (planned) | Print one request from the JSONL log, with a link to its Langfuse trace. |
 
 **Environment variables** (loaded from `.env`, never committed)
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `ADMIN_DATABASE_URL` | required | Admin connection for `demo load` and `apply-grants` only; never used by the agents. |
 | `DATABASE_URL` | required | Read-only role connection. No default, so a missing value fails fast. |
 | `ETL_DATABASE_URL` | required | ETL role connection. |
 | `LLM_LOW`, `LLM_HIGH` | see Models | `provider:model` per tier. |
 | `GROQ_API_KEY`, `GOOGLE_API_KEY` | none | Provider keys. |
 | `MAX_SQL_RETRIES` | 2 | Retry cap in the SQL Analyst. |
 | `MAX_ROWS` | 1000 | Authoritative row cap. |
-| `STATEMENT_TIMEOUT_MS` | 10000 | Query timeout on the read-only role. |
+| `STATEMENT_TIMEOUT_MS` | 10000 | Per-session query timeout applied by `run_query`. |
+| `MAX_CONTEXT_CHARS` | 12000 | Schema context cap before table selection kicks in. |
+| `JUDGE_ENABLED` | true | Turn the LLM judge off if it over-rejects on small models. |
 | `MAX_LLM_CALLS_PER_REQUEST` | 12 | Hard cap, protects free-tier quotas. |
 | `ETL_ALLOWED_HOSTS` | empty (deny all) | Comma-separated allow-list for `fetch_api`. |
 | `HINTS_PATH` | empty (no hints) | Optional domain hints file. The Ola demo hints are bundled at `src/datapilot/demo/hints.yaml`. A set but missing path is an error. |
@@ -341,11 +357,11 @@ Agentic systems fail in ways that are only visible in a trace, so every request 
 - generated SQL, safety verdicts with reasons, retry count and the DB errors that caused them;
 - final answer and status (`ok`, `refused`, `failed`).
 
-**Langfuse (primary).** A self-hosted Langfuse instance runs in Docker Compose next to Postgres. The Langfuse LangChain callback handler is attached to every graph invocation, so each node's prompt, response, latency, token count and cost appear as one trace with nested spans. Custom metadata (request id, route, safety verdict, attempt number) is added as trace tags and scores, so queries like "all requests that needed retries" or "all refusals" are one filter in the UI. The eval runner uses Langfuse datasets to record accuracy per run and compare runs across prompt or model changes.
+**Langfuse (primary).** A self-hosted Langfuse instance runs in Docker Compose next to Postgres. The Langfuse LangChain callback handler is attached to every graph invocation, so each node's prompt, response, latency, token count and cost appear as one trace with nested spans. The request id is passed as trace metadata; richer tags and scores (route, safety verdict, attempt number) and Langfuse datasets for eval runs are planned. **Status:** the handler is wired in but untested, and the installed Python SDK (v5) may not be compatible with the self-hosted v2 server in `docker-compose.yml`; this must be resolved (pin the SDK or move to Langfuse v3) before relying on it.
 
-**JSONL log (offline fallback).** Each request also appends one line to `logs/traces.jsonl` with request id, route, curated question, final SQL, safety verdicts, attempts, status and token totals. Tests and the eval runner read this file, so they work without Langfuse running. If `LANGFUSE_HOST` is unset or unreachable, the agent logs a warning and continues; observability must never break a request.
+**JSONL log (offline fallback).** Each request also appends one line to `logs/traces.jsonl` with request id, route, curated question, final SQL, safety verdicts, attempts, status and token totals. The planned eval runner will read this file, so evals work without Langfuse running. If Langfuse is not configured or its setup fails, the agent logs a warning and continues; observability must never break a request.
 
-**Privacy.** Traces contain prompts and query results, so they may include business data. Langfuse is self-hosted, so nothing leaves the machine except the LLM calls themselves. Hidden columns never appear in traces because they never reach the prompt or the result set.
+**Privacy.** Traces contain prompts and query results, so they may include business data. Langfuse is self-hosted, so nothing leaves the machine except the LLM calls themselves. Values of hidden columns never appear in traces because they never reach the prompt or the result set. A refused query or the user's own question may still name a hidden column.
 
 The callback interface is generic, so LangSmith could replace Langfuse by swapping the handler.
 
@@ -353,8 +369,9 @@ The callback interface is generic, so LangSmith could replace Langfuse by swappi
 
 ## 14. Testing strategy
 
-- **Unit (no LLM):** static safety checks against a corpus of malicious and benign SQL; routing logic; hint merging; schema introspection against a test database.
-- **Graph tests (mocked LLM):** every path (safe, unsafe, retry then success, retry exhausted).
+- **Unit (no LLM):** static safety checks against a corpus of malicious and benign SQL; hint merging; config rules; context trimming; LLM-layer repair and backoff; routing logic (Phase 5).
+- **Security tests (real Postgres roles, no LLM):** the read-only role cannot write, run DDL or read hidden columns; the ETL role cannot touch source tables; timeouts are enforced.
+- **Graph tests (scripted LLM, real database):** every path (safe, unsafe, retry then success, retry exhausted, judge objection, permission error, call budget, truncation, summary failure).
 - **Live evals (opt-in):** ~20 question/expected-result pairs on the demo dataset, comparing result sets rather than SQL text.
 
 ---
@@ -369,6 +386,8 @@ The callback interface is generic, so LangSmith could replace Langfuse by swappi
 | Cost on large schemas | Table selection; cap context size. |
 | Which API for the ETL demo? | Default: Open-Meteo (free, no key), joined to rides by city and date. |
 | CLI vs web UI | CLI first; Streamlit later if wanted. |
+| Langfuse SDK v5 vs self-hosted server v2 | Untested; pin the SDK or move to Langfuse v3 when tracing is first exercised. |
+| ETL role cannot read the city list it needs | Add an explicit reference-table grant in Phase 4. |
 
 ---
 
@@ -377,18 +396,22 @@ The callback interface is generic, so LangSmith could replace Langfuse by swappi
 ```
 datapilot/
   docs/DESIGN.md
-  docker-compose.yml          # Postgres 16 + role/schema init + Langfuse (web, worker, its own DB)
-  db/init/                    # roles, staging schema, grants
-  pyproject.toml
+  docker-compose.yml          # Postgres 16; Langfuse v2 + its own DB under --profile observability
+  db/init/                    # roles, staging schema, load log
+  pyproject.toml, uv.lock
   .env.example
+  logs/                       # traces.jsonl (gitignored)
   src/datapilot/
-    config.py                 # settings, model tiers
-    db.py                     # read-only and ETL connections, introspection
-    demo/generate.py          # synthetic Ola-style data
-    sql_analyst/{state,nodes,graph,safety}.py
-    etl_analyst/{tools,agent}.py
-    parent/{router,graph}.py
+    config.py                 # settings, get_llm(tier)
+    hints.py                  # hints.yaml loading
+    db.py                     # connections, introspection, grants, hints check
+    llm.py                    # structured output, repair, backoff
+    tracing.py                # JSONL log, optional Langfuse
     cli.py
+    demo/{generate.py,hints.yaml}
+    sql_analyst/{state,context,nodes,graph,safety}.py
+    etl_analyst/{tools,agent}.py      # Phase 4
+    parent/{router,graph}.py          # Phase 5
   tests/
 ```
 
@@ -397,7 +420,7 @@ datapilot/
 ## Appendix B. Build phases
 
 1. **Foundation (done):** scaffold, Postgres in Docker, roles, synthetic data, introspection.
-2. **SQL Analyst:** safety layers, nodes, graph, retries, tests.
+2. **SQL Analyst (built; live-model verification pending API keys):** safety layers, nodes, graph, retries, `ask` command, tracing, tests with a scripted LLM.
 3. **Eval harness:** the 20-question eval set and runner, so prompt and model choices are measured.
 4. **ETL Analyst:** tools, ReAct agent, staging-only writes.
 5. **Parent router:** routing, conversation loop.
