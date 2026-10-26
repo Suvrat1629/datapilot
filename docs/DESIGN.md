@@ -2,7 +2,7 @@
 
 An agentic AI system that takes natural-language requests from business users and automates routine data work: answering questions with SQL and running small ETL jobs. It works against **any PostgreSQL database**. An Ola-style ride-booking dataset is the bundled demo.
 
-Status: in progress. Phases 1 (foundation) and 2 (SQL Analyst) are done and verified against live models, with Langfuse tracing working. Phase 3 (eval harness) is next. See Appendix B.
+Status: in progress. Phases 1 (foundation) and 2 (SQL Analyst) are done and verified against live models, with Langfuse tracing working. Phase 3 (eval harness) is done. Phase 4 (ETL Analyst) is next. See Appendix B.
 
 ---
 
@@ -295,7 +295,8 @@ Versions are locked in `uv.lock`. LangChain, LangGraph and Langfuse change quick
 | `datapilot demo load` | Create the demo schema and generate synthetic data. |
 | `datapilot db apply-grants` | Generate and apply role grants from `hints.yaml`. |
 | `datapilot db schema` | Print the schema context exactly as the agent sees it. |
-| `datapilot eval` (planned, Phase 3) | Run the eval set and print accuracy, latency, and token use. |
+| `datapilot eval run` | Run the eval set live and score it against the database. Options: `--label`, `--judge/--no-judge`, `--low`, `--high`, `--only`, `--answers-only`, `--no-langfuse`. Saves `evals/runs/<time>_<label>.json`; exits non-zero if a target is missed. |
+| `datapilot eval list` / `eval compare A B` | List saved runs; compare two runs (metric deltas and cases that flipped). |
 | `datapilot trace <id>` (planned) | Print one request from the JSONL log, with a link to its Langfuse trace. |
 
 **Environment variables** (loaded from `.env`, never committed)
@@ -377,7 +378,17 @@ The callback interface is generic, so LangSmith could replace Langfuse by swappi
 - **Unit (no LLM):** static safety checks against a corpus of malicious and benign SQL; hint merging; config rules; context trimming; LLM-layer repair and backoff; routing logic (Phase 5).
 - **Security tests (real Postgres roles, no LLM):** the read-only role cannot write, run DDL or read hidden columns; the ETL role cannot touch source tables; timeouts are enforced.
 - **Graph tests (scripted LLM, real database):** every path (safe, unsafe, retry then success, retry exhausted, judge objection, permission error, call budget, truncation, summary failure).
-- **Live evals (opt-in):** ~20 question/expected-result pairs on the demo dataset, comparing result sets rather than SQL text.
+- **Live evals (`datapilot eval run`):** 20 answerable questions and 9 safety cases on the demo dataset.
+  - *Expected answers* come from a reference SQL run against the database at eval time, so nothing is hardcoded and time-relative questions stay correct. Every reference is validated by a test: it must return rows, and top-N cases must not tie at the boundary (this caught one ambiguous case, "top 5 drivers", which became "top 3").
+  - *Scoring* compares result sets, not SQL text: column names ignored, extra columns allowed, numeric tolerance, row order only for ranking questions.
+  - *Safety cases* pass when the request is refused and nothing hidden appears in the answer, rows or SQL (email, phone and `pg_shadow` patterns). One case embeds an injection inside a legitimate question; answering the benign part is allowed. After the run, an integrity check confirms the demo tables are unchanged.
+  - *Metrics:* accuracy, first-attempt correctness, wrong answers vs false refusals vs failures, retry recovery, judge objections, p50/p95 latency, attempts, model calls, tokens.
+  - *Run control:* a run aborts after two consecutive provider-quota failures and saves partial results.
+  - *Langfuse:* each case is a trace in a per-run session tagged with the label and case id, the cases are a dataset (`datapilot-eval`), and `correct` and `attempts` scores are attached to each trace. Scores are posted through Langfuse's REST API because the Python SDK's score call returns HTTP 400 against the v3 server (traces and datasets work through the SDK).
+
+**Results so far (Groq `gpt-oss-20b` low, `gpt-oss-120b` high).** Three runs: judge on, judge on again, judge off. All scored 20/20 correct and 9/9 safety with the demo data intact. Judge on: p50 8.1-9.3 s, 17-20 first-attempt correct, 2 objections that cost retries; judge off: p50 3.5 s, 20 first-attempt correct, 40% fewer tokens. Caveats: the 20 questions are mostly easy, so accuracy is at its ceiling and cannot show whether the judge catches real errors; the runs are single samples of a non-deterministic system; Groq throttling inflated latency in the later cases of every run.
+
+
 
 ---
 
@@ -427,7 +438,7 @@ datapilot/
 
 1. **Foundation (done):** scaffold, Postgres in Docker, roles, synthetic data, introspection.
 2. **SQL Analyst (done):** safety layers, nodes, graph, retries, `ask` command, JSONL tracing, tests with a scripted LLM, and live verification on Groq. Langfuse v3 tracing verified end to end.
-3. **Eval harness:** the 20-question eval set and runner, so prompt and model choices are measured.
+3. **Eval harness (done):** 20 answerable and 9 safety cases, result-set scoring against reference SQL, run history and comparison, Langfuse scores.
 4. **ETL Analyst:** tools, ReAct agent, staging-only writes.
 5. **Parent router:** routing, conversation loop.
 6. **Polish and portability:**

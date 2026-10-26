@@ -115,4 +115,31 @@ def test_langfuse_setup_failure_is_swallowed(monkeypatch):
     monkeypatch.setattr(
         langfuse, "Langfuse", lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
     )
-    assert tracing.langfuse_config("id") == {}
+    tracing.langfuse_client.cache_clear()
+    try:
+        assert tracing.langfuse_config("id") == {}
+    finally:
+        tracing.langfuse_client.cache_clear()
+
+
+def test_langfuse_client_is_built_from_settings_not_environment(monkeypatch):
+    import langfuse
+
+    seen = {}
+    monkeypatch.setattr(langfuse, "Langfuse", lambda **kw: seen.update(kw) or object())
+    monkeypatch.setattr(
+        tracing,
+        "get_settings",
+        lambda: type(
+            "S",
+            (),
+            {"langfuse_host": "http://h", "langfuse_public_key": "pk", "langfuse_secret_key": "sk"},
+        )(),
+    )
+    tracing.langfuse_client.cache_clear()
+    try:
+        tracing.langfuse_client()
+        tracing.langfuse_client()  # cached: constructed once
+    finally:
+        tracing.langfuse_client.cache_clear()
+    assert seen == {"public_key": "pk", "secret_key": "sk", "host": "http://h"}

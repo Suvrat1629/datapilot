@@ -9,6 +9,7 @@ import json
 import logging
 import uuid
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -56,19 +57,39 @@ def log_request(
         log.warning("could not write trace log: %s", e)
 
 
-def langfuse_config(request_id: str) -> dict[str, Any]:
-    """LangChain run config carrying a Langfuse handler, or {} when Langfuse is not set up."""
+def langfuse_configured() -> bool:
     s = get_settings()
-    if not (s.langfuse_host and s.langfuse_public_key and s.langfuse_secret_key):
+    return bool(s.langfuse_host and s.langfuse_public_key and s.langfuse_secret_key)
+
+
+@lru_cache
+def langfuse_client():
+    """One Langfuse client built from our settings. The SDK itself only reads environment
+    variables, but our keys live in .env, so every caller must go through here."""
+    from langfuse import Langfuse
+
+    s = get_settings()
+    return Langfuse(
+        public_key=s.langfuse_public_key, secret_key=s.langfuse_secret_key, host=s.langfuse_host
+    )
+
+
+def langfuse_config(
+    request_id: str, *, session_id: str | None = None, tags: list[str] | None = None
+) -> dict[str, Any]:
+    """LangChain run config carrying a Langfuse handler, or {} when Langfuse is not set up."""
+    if not langfuse_configured():
         return {}
     try:
-        from langfuse import Langfuse
         from langfuse.langchain import CallbackHandler
 
-        Langfuse(
-            public_key=s.langfuse_public_key, secret_key=s.langfuse_secret_key, host=s.langfuse_host
-        )
-        return {"callbacks": [CallbackHandler()], "metadata": {"request_id": request_id}}
+        langfuse_client()
+        metadata: dict[str, Any] = {"request_id": request_id}
+        if session_id:
+            metadata["langfuse_session_id"] = session_id
+        if tags:
+            metadata["langfuse_tags"] = tags
+        return {"callbacks": [CallbackHandler()], "metadata": metadata}
     except Exception as e:  # SDK/server version mismatch, network, bad keys
         log.warning("Langfuse tracing disabled: %s", e)
         return {}
@@ -77,12 +98,9 @@ def langfuse_config(request_id: str) -> dict[str, Any]:
 def flush_langfuse() -> None:
     """Send buffered traces. The SDK exports in the background, so a short-lived process
     must flush before exiting or the trace is lost."""
-    s = get_settings()
-    if not (s.langfuse_host and s.langfuse_public_key and s.langfuse_secret_key):
+    if not langfuse_configured():
         return
     try:
-        from langfuse import get_client
-
-        get_client().flush()
+        langfuse_client().flush()
     except Exception as e:
         log.warning("Langfuse flush failed: %s", e)
