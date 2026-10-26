@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Annotated
 
+import psycopg
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
@@ -13,7 +14,7 @@ from rich.panel import Panel
 from rich.table import Table as RichTable
 
 from datapilot import db
-from datapilot.config import get_settings
+from datapilot.config import get_settings, split_csv
 from datapilot.hints import DEMO_HINTS_PATH, load_hints
 from datapilot.sql_analyst.graph import run_sql_analyst
 from datapilot.tracing import flush_langfuse, langfuse_config, log_request, new_request_id
@@ -32,15 +33,24 @@ console = Console()
 
 
 @demo_app.command("load")
-def demo_load() -> None:
+def demo_load(
+    force: bool = typer.Option(
+        False, "--force", help="Replace existing demo tables even if this was not created by demo."
+    ),
+) -> None:
     """Create the demo schema, generate synthetic data, and apply grants."""
-    from datapilot.demo.generate import generate
+    from datapilot.demo.generate import NotDemoDatabase, check_demo_target, generate
 
     hints = load_hints(DEMO_HINTS_PATH)
     with db.connect("admin") as admin:
+        try:
+            check_demo_target(admin, force)
+        except NotDemoDatabase as e:
+            console.print(Panel(str(e), title="Refusing to load the demo", border_style="red"))
+            raise typer.Exit(1) from None
         counts = generate(admin)
         granted = db.apply_grants(admin, hints)
-        db.apply_etl_grants(admin, hints, _split(get_settings().etl_readable_columns))
+        db.apply_etl_grants(admin, hints, split_csv(get_settings().etl_readable_columns))
 
     t = RichTable(title="Demo data loaded")
     t.add_column("what")
@@ -51,6 +61,128 @@ def demo_load() -> None:
     console.print(f"Grants applied to {len(granted)} tables for datapilot_ro.")
 
 
+def _require_safe_roles(*kinds: str) -> None:
+    """Stop before any model call if a database role is more powerful than the agent needs."""
+    from datapilot import guard
+
+    try:
+        guard.ensure_safe(kinds)  # type: ignore[arg-type]
+    except guard.UnsafeRole as e:
+        shown = "\n".join(f"- {p}" for p in e.problems[:8])
+        more = f"\n... and {len(e.problems) - 8} more" if len(e.problems) > 8 else ""
+        console.print(
+            Panel(
+                f"{shown}{more}\n\n{guard.FIX}",
+                title=f"Refusing to run: role '{e.role}' ({e.kind}) can do too much",
+                border_style="red",
+            )
+        )
+        raise typer.Exit(2) from None
+    except psycopg.Error as e:
+        first = (str(e).strip().splitlines() or [type(e).__name__])[0]
+        console.print(Panel(first, title="Cannot connect to the database", border_style="red"))
+        raise typer.Exit(2) from None
+
+
+@db_app.command("setup")
+def db_setup(
+    ro_role: str | None = typer.Option(None, help="Read-only role name (default RO_ROLE)."),
+    etl_role: str | None = typer.Option(None, help="ETL role name (default ETL_ROLE)."),
+    ro_password: str | None = typer.Option(None, help="Password for a new read-only role."),
+    etl_password: str | None = typer.Option(None, help="Password for a new ETL role."),
+    reset_passwords: bool = typer.Option(
+        False, "--reset-passwords", help="Also set new passwords on roles that already exist."
+    ),
+) -> None:
+    """Create the limited roles, the staging schema and grants on ADMIN_DATABASE_URL's database."""
+    from datapilot.setup import connection_url, setup_database
+
+    settings = get_settings()
+    ro, etl_name = ro_role or settings.ro_role, etl_role or settings.etl_role
+    hints = load_hints(settings.hints_path)
+    with db.connect("admin") as admin:
+        for w in db.check_hints(admin, hints):
+            console.print(f"[yellow]warning:[/yellow] {w}")
+        try:
+            report = setup_database(
+                admin,
+                settings,
+                hints,
+                ro_role=ro,
+                etl_role=etl_name,
+                ro_password=ro_password,
+                etl_password=etl_password,
+                reset_passwords=reset_passwords,
+            )
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1) from None
+
+    console.print(f"Database [bold]{report.database}[/bold]")
+    console.print(f"Created roles: {', '.join(report.created) or 'none'}")
+    console.print(f"Already existed: {', '.join(report.existing) or 'none'}")
+    for table, cols in report.granted.items():
+        console.print(f"  {ro} may read [bold]{table}[/bold] ({len(cols)} columns)")
+    for table, cols in report.etl_granted.items():
+        console.print(f"  {etl_name} may read [bold]{table}[/bold]: {', '.join(cols)}")
+
+    console.print("\nPut this in .env:")
+    lines = []
+    for role, key in ((ro, "DATABASE_URL"), (etl_name, "ETL_DATABASE_URL")):
+        pw = report.passwords.get(role)
+        url = connection_url(settings.admin_database_url, role, pw)
+        if not pw:
+            url = url.replace("@", ":<existing password>@", 1)
+        lines.append(f"{key}={url}")
+    if (ro, etl_name) != (settings.ro_role, settings.etl_role):
+        lines += [f"RO_ROLE={ro}", f"ETL_ROLE={etl_name}"]
+    console.print("\n".join(lines), markup=False, highlight=False, soft_wrap=True)
+
+    bad = {r: p for r, p in report.problems.items() if p}
+    if bad:
+        for role, problems in bad.items():
+            console.print(f"[red]Verification failed for {role}:[/red]")
+            for p in problems[:8]:
+                console.print(f"  - {p}", markup=False)
+        console.print(
+            "\nSomething outside this tool (for example PUBLIC privileges or role membership) "
+            "gives these roles more access. Fix it, then run `datapilot db check`."
+        )
+        raise typer.Exit(1)
+    console.print(
+        "[green]Verified:[/green] the read-only role cannot write and hidden columns "
+        "are unreadable; the ETL role can only write to staging."
+    )
+
+
+@db_app.command("check")
+def db_check() -> None:
+    """Check that DATABASE_URL and ETL_DATABASE_URL roles are limited enough to run the agent."""
+    from datapilot import guard
+
+    settings = get_settings()
+    hints = load_hints(settings.hints_path)
+    failed = False
+    for kind in ("ro", "etl"):
+        try:
+            with db.connect(kind) as conn:  # type: ignore[arg-type]
+                role = conn.execute("SELECT current_user AS u").fetchone()["u"]
+                problems = guard.check_role(conn, kind, hints, settings)  # type: ignore[arg-type]
+        except psycopg.Error as e:
+            console.print(f"[red]{kind}: cannot connect: {str(e).splitlines()[0]}[/red]")
+            failed = True
+            continue
+        if problems:
+            failed = True
+            console.print(f"[red]{kind} role '{role}' can do too much:[/red]")
+            for p in problems[:8]:
+                console.print(f"  - {p}", markup=False)
+        else:
+            console.print(f"[green]{kind} role '{role}' is limited as expected.[/green]")
+    if failed:
+        raise typer.Exit(1)
+
+
 @db_app.command("apply-grants")
 def db_apply_grants() -> None:
     """Apply column-level SELECT grants to the read-only role, honouring hidden_columns."""
@@ -59,7 +191,7 @@ def db_apply_grants() -> None:
         for w in db.check_hints(admin, hints):
             console.print(f"[yellow]warning:[/yellow] {w}")
         granted = db.apply_grants(admin, hints)
-        etl = db.apply_etl_grants(admin, hints, _split(get_settings().etl_readable_columns))
+        etl = db.apply_etl_grants(admin, hints, split_csv(get_settings().etl_readable_columns))
     for table, cols in granted.items():
         console.print(f"[bold]{table}[/bold]: {', '.join(cols)}")
     for table, cols in etl.items():
@@ -121,6 +253,7 @@ def ask(
     as_json: bool = typer.Option(False, "--json", help="Print the full result as JSON."),
 ) -> None:
     """Ask one question; the SQL Analyst answers it from the database."""
+    _require_safe_roles("ro")
     request_id = new_request_id()
     start = time.monotonic()
     state = run_sql_analyst(question, config=langfuse_config(request_id))
@@ -144,6 +277,7 @@ def etl(
     as_json: bool = typer.Option(False, "--json", help="Print the full result as JSON."),
 ) -> None:
     """Load data from an allow-listed public API into the staging schema."""
+    _require_safe_roles("etl")
     import dataclasses
 
     from datapilot.etl_analyst.agent import run_etl_analyst
@@ -213,6 +347,7 @@ def chat(
     as_json: bool = typer.Option(False, "--json", help="Print the turn as JSON (one message)."),
 ) -> None:
     """Talk to DataPilot: it routes each message to the SQL or ETL analyst."""
+    _require_safe_roles("ro", "etl")
     import dataclasses
 
     from datapilot.parent.graph import ChatSession
@@ -286,10 +421,6 @@ def chat(
 # ---- eval ---------------------------------------------------------------------------------
 
 
-def _split(csv: str | None) -> list[str]:
-    return [x.strip() for x in (csv or "").split(",") if x.strip()]
-
-
 @eval_app.command("run")
 def eval_run(
     label: str = typer.Option("baseline", help="Name for this run (used in the saved file)."),
@@ -321,7 +452,7 @@ def eval_run(
     settings = get_settings()
 
     cases = list(ANSWER_CASES if answers_only else ALL_CASES)
-    wanted = set(_split(only))
+    wanted = set(split_csv(only))
     if wanted:
         cases = [c for c in cases if c.id in wanted]
         if not cases:

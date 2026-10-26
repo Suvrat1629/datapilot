@@ -12,7 +12,7 @@ import psycopg
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from datapilot import db
-from datapilot.config import Settings, get_settings
+from datapilot.config import Settings, get_settings, readable_schemas
 from datapilot.hints import Hints, load_hints
 from datapilot.llm import LLMError, LLMResult, call_llm
 from datapilot.sql_analyst.context import build_context
@@ -148,7 +148,7 @@ class SqlAnalystNodes:
     def add_context(self, state: SqlState) -> dict[str, Any]:
         try:
             with self.d.connect() as conn:
-                tables = db.introspect(conn, self.d.hints)
+                tables = db.introspect(conn, self.d.hints, readable_schemas(self.d.settings))
         except psycopg.Error as e:
             return self._fail(f"Could not read the database schema: {str(e)[:150]}")
         if not tables:
@@ -204,7 +204,12 @@ class SqlAnalystNodes:
 
     def safety_check(self, state: SqlState) -> dict[str, Any]:
         # Inject cap + 1 so run_query can tell "exactly cap rows" from "more than cap rows".
-        result = check_sql(state.sql or "", self.d.hints, max_rows=self.d.settings.max_rows + 1)
+        result = check_sql(
+            state.sql or "",
+            self.d.hints,
+            max_rows=self.d.settings.max_rows + 1,
+            allowed_schemas=frozenset(readable_schemas(self.d.settings)),
+        )
         if not result.ok:
             return {
                 "safety": SafetyVerdict(ok=False, reason=result.reason),

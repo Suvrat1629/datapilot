@@ -36,10 +36,27 @@ class Settings(BaseSettings):
     etl_max_response_bytes: int = 5_000_000
     etl_fetch_timeout_s: float = 15.0
     hints_path: str = ""
+    # Schemas the agent may read, comma-separated. `staging` (ETL output) is always included.
+    schemas: str = "public"
+    ro_role: str = "datapilot_ro"  # role behind DATABASE_URL
+    etl_role: str = "datapilot_etl"  # role behind ETL_DATABASE_URL
 
     langfuse_host: str = ""
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
+
+
+def split_csv(value: str | None) -> list[str]:
+    return [x.strip() for x in (value or "").split(",") if x.strip()]
+
+
+def readable_schemas(settings: Settings) -> tuple[str, ...]:
+    """Configured schemas plus `staging`, in a stable order without duplicates."""
+    out: list[str] = []
+    for s in [*split_csv(settings.schemas), "staging"]:
+        if s not in out:
+            out.append(s)
+    return tuple(out)
 
 
 @lru_cache

@@ -39,7 +39,10 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["db: needs the Postgres container running"]
+markers = [
+    "db: needs the Postgres container running",
+    "real_guard: run the CLI role guard instead of skipping it",
+]
 
 [tool.ruff]
 line-length = 100

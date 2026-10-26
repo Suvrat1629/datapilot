@@ -7,7 +7,7 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
-from datapilot.config import get_settings
+from datapilot.config import get_settings, readable_schemas, split_csv
 from datapilot.hints import Hints
 
 Role = Literal["admin", "ro", "etl"]
@@ -43,15 +43,12 @@ class Table:
         return self.name if self.schema == "public" else f"{self.schema}.{self.name}"
 
 
-DEFAULT_SCHEMAS = ("public", "staging")
-
-
 def introspect(
-    conn: psycopg.Connection, hints: Hints, schemas: tuple[str, ...] = DEFAULT_SCHEMAS
+    conn: psycopg.Connection, hints: Hints, schemas: tuple[str, ...] | None = None
 ) -> list[Table]:
-    """Introspect every schema in `schemas` (tables loaded by the ETL agent live in staging)."""
+    """Introspect the configured schemas plus staging (where the ETL agent loads tables)."""
     tables: list[Table] = []
-    for schema in schemas:
+    for schema in schemas or readable_schemas(get_settings()):
         tables.extend(_introspect_schema(conn, hints, schema))
     return tables
 
@@ -111,7 +108,7 @@ def _introspect_schema(conn: psycopg.Connection, hints: Hints, schema: str) -> l
         t, c = r["table_name"], r["column_name"]
         if t.startswith("_"):  # internal bookkeeping such as staging._loads
             continue
-        if schema == "public" and hints.is_hidden(t, c):
+        if hints.is_hidden(t, c, schema):
             continue
         col = Column(
             name=c,
@@ -143,7 +140,7 @@ def render_schema_context(tables: list[Table], hints: Hints) -> str:
     """Plain-text schema description for the LLM prompt."""
     lines: list[str] = []
     for t in tables:
-        th = hints.tables.get(t.name) if t.schema == "public" else None
+        th = hints.for_table(t.name, t.schema)
         header = f"TABLE {t.qualified}"
         if th and th.description:
             header += f" -- {th.description}"
@@ -166,115 +163,160 @@ def render_schema_context(tables: list[Table], hints: Hints) -> str:
     return "\n".join(lines).rstrip()
 
 
-def check_hints(conn: psycopg.Connection, hints: Hints, schema: str = "public") -> list[str]:
+def _columns_by_schema(conn: psycopg.Connection, schemas: list[str]) -> set[tuple[str, str, str]]:
+    rows = conn.execute(
+        "SELECT table_schema, table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = ANY(%s)",
+        (schemas,),
+    ).fetchall()
+    return {(r["table_schema"], r["table_name"], r["column_name"]) for r in rows}
+
+
+def _split_ref(ref: str) -> tuple[str, str, str] | None:
+    """`table.col` (public) or `schema.table.col` -> (schema, table, col); None if malformed."""
+    parts = ref.split(".")
+    if len(parts) == 2 and all(parts):
+        return "public", parts[0], parts[1]
+    if len(parts) == 3 and all(parts):
+        return parts[0], parts[1], parts[2]
+    return None
+
+
+def check_hints(
+    conn: psycopg.Connection, hints: Hints, schemas: list[str] | None = None
+) -> list[str]:
     """Warnings for hints that do not match the database (a stale hints file is dangerous:
     an unmatched hidden column means the intended protection is not applied)."""
-    rows = conn.execute(
-        "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = %s",
-        (schema,),
-    ).fetchall()
-    existing = {(r["table_name"], r["column_name"]) for r in rows}
-    tables = {t for t, _ in existing}
+    schemas = schemas or split_csv(get_settings().schemas) or ["public"]
+    existing = _columns_by_schema(conn, schemas)
+    tables = {(s, t) for s, t, _ in existing}
     warnings: list[str] = []
     for name, th in hints.tables.items():
-        if name not in tables:
+        s, _, t = name.rpartition(".")
+        s = s or "public"
+        if (s, t) not in tables:
             warnings.append(f"hints: table '{name}' does not exist")
             continue
         for col in th.columns:
-            if (name, col) not in existing:
+            if (s, t, col) not in existing:
                 warnings.append(f"hints: column '{name}.{col}' does not exist")
     for ref in hints.hidden_columns:
-        t, _, c = ref.partition(".")
-        if (t, c) not in existing:
+        parsed = _split_ref(ref)
+        if parsed is None or parsed not in existing:
             warnings.append(f"hints: hidden column '{ref}' does not exist, nothing is hidden by it")
     return warnings
 
 
+def _qualified(schema: str, table: str) -> str:
+    return table if schema == "public" else f"{schema}.{table}"
+
+
 def apply_grants(
-    admin: psycopg.Connection, hints: Hints, schema: str = "public"
+    admin: psycopg.Connection,
+    hints: Hints,
+    schemas: list[str] | None = None,
+    role: str | None = None,
 ) -> dict[str, list[str]]:
-    """Grant the read-only role SELECT on every non-hidden column. Returns table -> columns."""
+    """Grant the read-only role SELECT on every non-hidden column of the configured schemas.
+
+    Returns qualified table -> columns. Tables starting with `_` are internal and skipped.
+    """
+    settings = get_settings()
+    schemas = schemas or split_csv(settings.schemas) or ["public"]
+    role = role or settings.ro_role
     granted: dict[str, list[str]] = {}
-    admin.execute(
-        sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM datapilot_ro").format(
-            sql.Identifier(schema)
-        )
-    )
-    rows = admin.execute(
-        """
-        SELECT table_name, column_name
-        FROM information_schema.columns
-        WHERE table_schema = %s
-        ORDER BY table_name, ordinal_position
-        """,
-        (schema,),
-    ).fetchall()
-    by_table: dict[str, list[str]] = {}
-    for r in rows:
-        if not hints.is_hidden(r["table_name"], r["column_name"]):
-            by_table.setdefault(r["table_name"], []).append(r["column_name"])
-    for table, columns in by_table.items():
+    for schema in schemas:
         admin.execute(
-            sql.SQL("GRANT SELECT ({cols}) ON {s}.{t} TO datapilot_ro").format(
-                cols=sql.SQL(", ").join(sql.Identifier(c) for c in columns),
-                s=sql.Identifier(schema),
-                t=sql.Identifier(table),
+            sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM {}").format(
+                sql.Identifier(schema), sql.Identifier(role)
             )
         )
-        granted[table] = columns
+        admin.execute(
+            sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                sql.Identifier(schema), sql.Identifier(role)
+            )
+        )
+        rows = admin.execute(
+            """
+            SELECT table_name, column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name NOT LIKE '\\_%%'
+            ORDER BY table_name, ordinal_position
+            """,
+            (schema,),
+        ).fetchall()
+        by_table: dict[str, list[str]] = {}
+        for r in rows:
+            if not hints.is_hidden(r["table_name"], r["column_name"], schema):
+                by_table.setdefault(r["table_name"], []).append(r["column_name"])
+        for table, columns in by_table.items():
+            admin.execute(
+                sql.SQL("GRANT SELECT ({cols}) ON {s}.{t} TO {r}").format(
+                    cols=sql.SQL(", ").join(sql.Identifier(c) for c in columns),
+                    s=sql.Identifier(schema),
+                    t=sql.Identifier(table),
+                    r=sql.Identifier(role),
+                )
+            )
+            granted[_qualified(schema, table)] = columns
     admin.commit()
     return granted
 
 
 def apply_etl_grants(
-    admin: psycopg.Connection, hints: Hints, columns: list[str], schema: str = "public"
+    admin: psycopg.Connection,
+    hints: Hints,
+    columns: list[str],
+    schemas: list[str] | None = None,
+    role: str | None = None,
 ) -> dict[str, list[str]]:
-    """Let the ETL role read only the listed "table.column" entries from `schema`.
+    """Let the ETL role read only the listed `table.column` / `schema.table.column` entries.
 
     Revokes everything first, so re-running is idempotent and removing an entry removes the
     grant. Refuses hidden columns and entries that do not exist, instead of skipping them.
     """
-    by_table: dict[str, list[str]] = {}
+    settings = get_settings()
+    schemas = schemas or split_csv(settings.schemas) or ["public"]
+    role = role or settings.etl_role
+    wanted: dict[tuple[str, str], list[str]] = {}
     for ref in columns:
-        table, _, col = ref.partition(".")
-        if not table or not col:
-            raise ValueError(f"ETL_READABLE_COLUMNS entry {ref!r} must look like table.column")
-        if hints.is_hidden(table, col):
+        parsed = _split_ref(ref)
+        if parsed is None:
+            raise ValueError(
+                f"ETL_READABLE_COLUMNS entry {ref!r} must look like table.column "
+                "or schema.table.column"
+            )
+        schema, table, col = parsed
+        if hints.is_hidden(table, col, schema):
             raise ValueError(f"{ref} is a hidden column and cannot be made readable to ETL")
-        by_table.setdefault(table, []).append(col)
+        if schema not in schemas:
+            raise ValueError(f"{ref}: schema {schema!r} is not in SCHEMAS ({', '.join(schemas)})")
+        wanted.setdefault((schema, table), []).append(col)
 
-    existing = {
-        (r["table_name"], r["column_name"])
-        for r in admin.execute(
-            "SELECT table_name, column_name FROM information_schema.columns "
-            "WHERE table_schema = %s",
-            (schema,),
-        )
-    }
-    missing = [ref for ref in columns if tuple(ref.split(".", 1)) not in existing]
+    existing = _columns_by_schema(admin, schemas)
+    missing = [ref for ref in columns if _split_ref(ref) not in existing]
     if missing:
         raise ValueError(f"ETL_READABLE_COLUMNS names columns that do not exist: {missing}")
 
-    admin.execute(
-        sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM datapilot_etl").format(
-            sql.Identifier(schema)
-        )
-    )
-    if by_table:
+    for schema in schemas:
         admin.execute(
-            sql.SQL("GRANT USAGE ON SCHEMA {} TO datapilot_etl").format(sql.Identifier(schema))
+            sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM {}").format(
+                sql.Identifier(schema), sql.Identifier(role)
+            )
         )
-    else:
+        used = any(s == schema for s, _ in wanted)
+        verb = "GRANT USAGE ON SCHEMA {} TO {}" if used else "REVOKE USAGE ON SCHEMA {} FROM {}"
+        admin.execute(sql.SQL(verb).format(sql.Identifier(schema), sql.Identifier(role)))
+    granted: dict[str, list[str]] = {}
+    for (schema, table), cols in wanted.items():
         admin.execute(
-            sql.SQL("REVOKE USAGE ON SCHEMA {} FROM datapilot_etl").format(sql.Identifier(schema))
-        )
-    for table, cols in by_table.items():
-        admin.execute(
-            sql.SQL("GRANT SELECT ({cols}) ON {s}.{t} TO datapilot_etl").format(
+            sql.SQL("GRANT SELECT ({cols}) ON {s}.{t} TO {r}").format(
                 cols=sql.SQL(", ").join(sql.Identifier(c) for c in cols),
                 s=sql.Identifier(schema),
                 t=sql.Identifier(table),
+                r=sql.Identifier(role),
             )
         )
+        granted[_qualified(schema, table)] = cols
     admin.commit()
-    return by_table
+    return granted

@@ -11,7 +11,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
-from datapilot.config import Settings, get_settings
+from datapilot.config import Settings, get_settings, readable_schemas
 from datapilot.etl_analyst import http
 from datapilot.etl_analyst.agent import EtlResult, run_etl_analyst
 from datapilot.llm import LLMError, LLMResult, call_llm
@@ -64,7 +64,9 @@ def _table_names(deps: ParentDeps) -> list[str]:
         from datapilot.hints import load_hints
 
         with db.connect("ro") as conn:
-            tables = db.introspect(conn, load_hints(deps.settings.hints_path))
+            tables = db.introspect(
+                conn, load_hints(deps.settings.hints_path), readable_schemas(deps.settings)
+            )
         return [t.qualified for t in tables]
     except Exception:
         return []

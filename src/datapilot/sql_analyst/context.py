@@ -13,7 +13,7 @@ def _words(text: str) -> set[str]:
 
 
 def _score(table: Table, question_words: set[str], hints: Hints) -> int:
-    th = hints.tables.get(table.name)
+    th = hints.for_table(table.name, table.schema)
     haystack = _words(table.name.replace("_", " "))
     for c in table.columns:
         haystack |= _words(c.name.replace("_", " "))
@@ -31,7 +31,7 @@ def build_context(tables: list[Table], hints: Hints, question: str, max_chars: i
     if len(full) <= max_chars:
         return full
 
-    by_name = {t.name: t for t in tables}
+    by_name = {t.qualified: t for t in tables}
     qw = _words(question)
     ranked = sorted(tables, key=lambda t: (-_score(t, qw, hints), t.name))
 
@@ -52,8 +52,11 @@ def build_context(tables: list[Table], hints: Hints, question: str, max_chars: i
         if not add(t):
             continue
         for c in t.columns:  # pull in tables this one joins to
-            if c.fk and c.fk.split(".")[0] in by_name:
-                add(by_name[c.fk.split(".")[0]])
+            ref = c.fk.split(".")[0] if c.fk else None
+            if ref and t.schema != "public":  # foreign keys stay within the table's schema
+                ref = f"{t.schema}.{ref}"
+            if ref in by_name:
+                add(by_name[ref])
     if not chosen:  # nothing matched or nothing fit: fall back to the first tables that fit
         for t in tables:
             if not add(t):

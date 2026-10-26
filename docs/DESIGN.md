@@ -2,7 +2,7 @@
 
 An agentic AI system that takes natural-language requests from business users and automates routine data work: answering questions with SQL and running small ETL jobs. It works against **any PostgreSQL database**. An Ola-style ride-booking dataset is the bundled demo.
 
-Status: in progress. Phases 1 (foundation) and 2 (SQL Analyst) are done and verified against live models, with Langfuse tracing working. Phase 3 (eval harness) is done. Phase 4 (ETL Analyst) and Phase 5 (parent router and `chat`) are built. See Appendix B.
+Status: all six phases are built and tested; the web UI is deferred. Phases 1 to 3 (foundation, SQL Analyst, eval harness) were verified against live models, Phase 4 (ETL) and Phase 5 (router and `chat`) against Groq and Open-Meteo, and Phase 6 (portability, role guard, multi-schema, README) with scratch-database tests. See Appendix B.
 
 ---
 
@@ -223,7 +223,11 @@ If step 6 had failed with `column "created_at" does not exist`, the error goes b
 | Schema | Discovered at runtime from `information_schema` and `pg_catalog`. Nothing hard-coded. |
 | Domain knowledge | Optional `hints.yaml`: table/column descriptions, business definitions, units, sensitive columns. |
 | Large schemas | Table selection when the schema exceeds `MAX_CONTEXT_CHARS`: keyword overlap between the question and table, column and hint text, plus FK neighbours. Embedding or LLM ranking is a possible upgrade. |
-| Connection | `DATABASE_URL` (read-only role), `ETL_DATABASE_URL` (ETL role), `ADMIN_DATABASE_URL` (setup only: demo load and grants). |
+| Connection | `DATABASE_URL` (read-only role), `ETL_DATABASE_URL` (ETL role), `ADMIN_DATABASE_URL` (setup only: `db setup`, demo load and grants). |
+| Setup on an existing database | `datapilot db setup` creates the two limited roles (names configurable), the `staging` schema and the grants, then verifies by assuming each role (`SET ROLE`). It never touches existing data and does not revoke from `PUBLIC`; if a `PUBLIC` privilege still lets a role write or read a hidden column, verification reports it instead of hiding it. |
+| Role guard | Before `ask`, `etl` and `chat`, the connected roles are checked against Postgres itself (superuser and similar attributes, create/write privileges, readable hidden columns, ETL reads outside `ETL_READABLE_COLUMNS`). Unsafe roles stop the program with exit code 2. `datapilot db check` runs the same checks on demand. |
+| Schemas | `SCHEMAS` (default `public`) plus `staging`. Hints and hidden columns use `table.column` for `public` and `schema.table.column` elsewhere. Introspection, grants, the static schema allow-list and context trimming all follow the setting. |
+| Demo safety | `demo load` drops and recreates its tables, so it refuses unless the public schema is empty or carries the `_datapilot_demo` marker it creates (`--force` overrides). |
 | Demo data | `datapilot demo load` generates the synthetic Ola-style dataset. The demo is the only place that knows about rides. |
 
 Example `hints.yaml`:
@@ -304,6 +308,8 @@ Versions are locked in `uv.lock`. LangChain, LangGraph and Langfuse change quick
 |---|---|
 | `datapilot chat ["message"]` | Talk to the parent agent. With a message it answers once and exits (`--json` available); without one it opens an interactive session with `/sql`, `/clear` and `/quit`. |
 | `datapilot eval routing` | Score the router on 20 labelled messages. |
+| `datapilot db setup` | Create the limited roles, `staging` and grants on the admin database; verify; print the `.env` lines. |
+| `datapilot db check` | Check that the configured roles are limited enough. |
 | `datapilot ask "<question>"` | One-shot question to the SQL Analyst; prints the answer and result table. Add `--show-sql` or `--json`. Exits non-zero on refusal or failure. |
 | `datapilot demo load` | Create the demo schema and generate synthetic data. |
 | `datapilot db apply-grants` | Generate and apply role grants from `hints.yaml`. |
@@ -328,7 +334,9 @@ Versions are locked in `uv.lock`. LangChain, LangGraph and Langfuse change quick
 | `JUDGE_ENABLED` | true | Turn the LLM judge off if it over-rejects on small models. |
 | `MAX_LLM_CALLS_PER_REQUEST` | 12 | Hard cap, protects free-tier quotas. |
 | `ETL_ALLOWED_HOSTS` | empty (deny all) | Comma-separated exact hostnames for `fetch_api`. |
-| `ETL_READABLE_COLUMNS` | empty | `table.column` list the ETL role may read. |
+| `ETL_READABLE_COLUMNS` | empty | `table.column` (or `schema.table.column`) list the ETL role may read. |
+| `SCHEMAS` | `public` | Schemas the agent may read; `staging` is always added. |
+| `RO_ROLE` / `ETL_ROLE` | `datapilot_ro` / `datapilot_etl` | Role names behind the two database URLs. |
 | `ETL_MAX_STEPS` / `ETL_MAX_FETCHES` | 20 / 50 | Agent step cap and HTTP requests per task. |
 | `ETL_MAX_ROWS` / `ETL_MAX_RESPONSE_BYTES` / `ETL_FETCH_TIMEOUT_S` | 100000 / 5000000 / 15 | Load, response and timeout limits. |
 | `HINTS_PATH` | empty (no hints) | Optional domain hints file. The Ola demo hints are bundled at `src/datapilot/demo/hints.yaml`. A set but missing path is an error. |
@@ -443,6 +451,8 @@ datapilot/
     cli.py
     demo/{generate.py,hints.yaml}
     sql_analyst/{state,context,nodes,graph,safety}.py
+    guard.py                  # role safety checks (startup and `db check`)
+    setup.py                  # `db setup`: roles, staging, grants, verification
     etl_analyst/{store,http,transforms,load,tools,agent}.py
     parent/{router,graph}.py          # Phase 5
   tests/
@@ -457,7 +467,7 @@ datapilot/
 3. **Eval harness (done):** 20 answerable and 9 safety cases, result-set scoring against reference SQL, run history and comparison, Langfuse scores.
 4. **ETL Analyst (done):** tools, ReAct agent, staging-only writes, atomic loads. Live-verified on Groq `gpt-oss-120b` with Open-Meteo: 12 cities × 30 days = 360 rows, re-run leaves 360 (idempotent), deletion / webhook-exfiltration / non-allow-listed-host requests are refused, and the SQL Analyst joins `staging.weather_daily` to bookings. A load takes about 100 to 130 s on the free tier, mostly per-minute token limits.
 5. **Parent router (done):** `RouteDecision` router, `both` (load then analyse), conversation history, `datapilot chat`, `eval routing`. Live-verified on Groq: SQL questions with follow-ups, small talk, a delete request declined, and a combined load-then-analyse request whose load succeeded (360 rows). The analyse half of that last request could not be run live because the free daily quota ran out; it is covered by tests with the real SQL Analyst. Routing accuracy was 19 to 20 of 20 over four runs, with the unsafe cases always correct.
-6. **Polish and portability:**
+6. **Polish and portability (done):** `db setup` / `db check`, startup role guard, `demo load` guard, multi-schema support, adversarial tests, README. Notes follow from the original plan:
    - `datapilot db setup`: create the roles, `staging` schema and grants on any existing database from an admin URL, with role and database names as parameters, and verify that the read-only role cannot write.
    - Startup guard: refuse to run the SQL agent if its role can write or is a superuser.
    - Guard on `demo load` so it cannot drop tables in a non-demo database.

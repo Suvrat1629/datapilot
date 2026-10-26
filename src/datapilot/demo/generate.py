@@ -66,8 +66,36 @@ FIRST = [
 ]
 LAST = ["Sharma", "Verma", "Iyer", "Reddy", "Patel", "Nair", "Gupta", "Singh", "Das", "Mehta"]
 
-DDL = """
-DROP TABLE IF EXISTS payments, bookings, drivers, customers, cities CASCADE;
+DEMO_TABLES = frozenset({"cities", "customers", "drivers", "bookings", "payments"})
+MARKER = "_datapilot_demo"
+
+
+class NotDemoDatabase(Exception):
+    """`demo load` drops and recreates tables, so it refuses to run on someone's real data."""
+
+
+def check_demo_target(admin: psycopg.Connection, force: bool = False) -> None:
+    rows = admin.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+    ).fetchall()
+    names = {r["table_name"] for r in rows}
+    if force or not names or MARKER in names:
+        return
+    clash = sorted(names & DEMO_TABLES)
+    found = ", ".join(sorted(names)[:8])
+    raise NotDemoDatabase(
+        f"This database already has tables in the public schema ({found}) and was not created "
+        f"by `demo load`. Loading the demo would DROP: {', '.join(sorted(DEMO_TABLES))}"
+        + (f" (existing: {', '.join(clash)})" if clash else "")
+        + ". Use an empty database, or pass --force if you are sure these are demo tables."
+    )
+
+
+DDL = f"""
+DROP TABLE IF EXISTS payments, bookings, drivers, customers, cities, {MARKER} CASCADE;
+CREATE TABLE {MARKER} (created_at timestamptz NOT NULL DEFAULT now());
+INSERT INTO {MARKER} DEFAULT VALUES;
 
 CREATE TABLE cities (
     id    integer PRIMARY KEY,
